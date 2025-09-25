@@ -13,7 +13,6 @@ import torchvision.transforms as T
 
 from .curvelet_ops import fdct2, pack_highfreq
 
-
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 
@@ -122,7 +121,7 @@ def curvelet_stats(
 
 class CurveletDataset(Dataset):
     """
-    If conditional=True: X = packed wedges (whitened), KW = {'conditioning': coarse}
+    If conditional=True: X = packed wedges (whitened), KW = {'conditional': coarse}
     else               : X = coarse, KW = {}
     """
     def __init__(
@@ -184,7 +183,7 @@ class CurveletDataset(Dataset):
                 mean_w = self.mean[start:start + 3 * Wj].view(-1, 1, 1).to(self.dev)
                 std_w = self.std[start:start + 3 * Wj].view(-1, 1, 1).to(self.dev).clamp_min(1e-6)
                 X = (X - mean_w) / std_w
-            KW = {"conditioning": coarse[0]}
+            KW = {"conditional": coarse[0]}  # KEY NAME MATCHES WAVELET SCRIPTS
         else:
             X = coarse[0]
             KW = {}
@@ -197,7 +196,7 @@ def load_data_curvelet(
     batch_size: int,
     j: int,
     conditional: bool,
-    image_size: Optional[int] = None,  # now optional
+    image_size: Optional[int] = None,
     angles_per_scale: Optional[Iterable[int] or str] = None,
     stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     deterministic: bool = False,
