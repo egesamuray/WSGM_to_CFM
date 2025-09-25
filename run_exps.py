@@ -9,7 +9,6 @@ from improved_diffusion import curvelet_datasets
 
 
 def _env_with_repo_on_path() -> dict:
-    """Ensure child Python processes can import 'improved_diffusion'."""
     env = os.environ.copy()
     repo_root = os.path.abspath(os.path.dirname(__file__))
     old = env.get("PYTHONPATH", "")
@@ -36,7 +35,6 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     print(f"Results will be saved to {results_dir}")
 
-    # Precompute stats for curvelet (fast stream over images)
     if args.task == "curvelet":
         print(f"Computing stats for scale {args.j}...")
         mean, std = curvelet_datasets.curvelet_stats(
@@ -44,7 +42,8 @@ def main():
             dir_name=args.data_dir,
             angles_per_scale=args.angles_per_scale,
             image_size=args.final_size,
-            limit=None,  # full set
+            limit=None,
+            device="cpu",  # IMPORTANT: keep stats on CPU (no CUDA init before DataLoader)
         )
         np.savez(os.path.join(results_dir, f"curvelet_stats_j{args.j}.npz"),
                  mean=mean.numpy(), std=std.numpy())
@@ -84,7 +83,7 @@ def main():
         ]
         subprocess.run(cmd_cond, check=True, cwd=repo_root, env=env)
 
-        # 3) Sample
+        # 3) Sample (optional: wire curvelet sampling once ready)
         print("Sampling...")
         cmd_sample = [
             sys.executable, "scripts/image_sample.py",
@@ -104,4 +103,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
