@@ -1,131 +1,106 @@
 # run_exps.py
-import os
-import subprocess
-import glob
-import time
 import argparse
+import os
+import sys
+import subprocess
+import numpy as np
+
+from improved_diffusion import curvelet_datasets
+
+
+def _env_with_repo_on_path() -> dict:
+    """Ensure child Python processes can import 'improved_diffusion'."""
+    env = os.environ.copy()
+    repo_root = os.path.abspath(os.path.dirname(__file__))
+    old = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (repo_root if not old else f"{repo_root}{os.pathsep}{old}")
+    return env
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--task", choices=["standard", "super_res", "wavelet", "curvelet"], required=True)
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--j", type=int, default=1, help="Scale index (1=finest).")
+    p.add_argument("--angles_per_scale", type=str, default=None, help="coarsest->finest, e.g. '8,16,16'")
+    p.add_argument("--final_size", type=int, default=64, help="image size (H=W)")
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--num_samples", type=int, default=16)
+    return p.parse_args()
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=["wavelet","curvelet"], default="curvelet")
-    parser.add_argument("--data_dir", type=str, required=True, help="Directory of training images")
-    parser.add_argument("--j", type=int, required=True, help="Number of scales (for wavelet/curvelet) or scale to train.")
-    parser.add_argument("--angles_per_scale", type=str, default=None, help="Angles per scale (comma-separated) for curvelet.")
-    parser.add_argument("--final_size", type=int, default=None, help="Final image size (px). If not given, will use dataset image size.")
-    parser.add_argument("--num_samples", type=int, default=16, help="Number of images to sample at the end.")
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    args = parser.parse_args()
-
-    # If final_size not provided, try to infer from data (e.g., by reading first image)
-    final_size = args.final_size
-    if final_size is None:
-        import glob
-        from PIL import Image
-        img_files = glob.glob(os.path.join(args.data_dir, "*"))
-        if img_files:
-            with Image.open(img_files[0]) as img:
-                final_size = max(img.size)
-        else:
-            raise ValueError("Could not infer final image size; please specify --final_size")
-
-    # Derive default angles if not provided for curvelet
-    if args.task == "curvelet" and args.angles_per_scale is None:
-        # Example default as described in plan
-        angles = []
-        ang = 8
-        for i in range(args.j):
-            angles.append(min(ang, 32))
-            if ang < 32:
-                ang *= 2
-        args.angles_per_scale = ",".join(map(str, angles))
-
-    # Directory to store results
-    exp_name = f"{args.task}_J{args.j}"
-    results_dir = os.path.join("results", exp_name)
+    args = parse_args()
+    results_dir = os.path.join("results", f"{args.task}_J{args.j}")
     os.makedirs(results_dir, exist_ok=True)
     print(f"Results will be saved to {results_dir}")
-    # Precompute stats (curvelet_stats will save to file)
-    if args.task == "curvelet":
-        for scale in range(1, args.j+1):
-            print(f"Computing stats for scale {scale}...")
-            # Compute stats by calling curvelet_stats (which caches to npz)
-            from improved_diffusion import curvelet_datasets
-            curvelet_datasets.curvelet_stats(scale, args.data_dir, angles_per_scale=[int(a) for a in args.angles_per_scale.split(',')])
 
-    # Train models
-    model_paths = {}
+    # Precompute stats for curvelet (fast stream over images)
     if args.task == "curvelet":
-        # Train coarsest coarse model
-        log_dir = os.path.join(results_dir, f"curvelet_coarse_J{args.j}")
-        os.makedirs(log_dir, exist_ok=True)
+        print(f"Computing stats for scale {args.j}...")
+        mean, std = curvelet_datasets.curvelet_stats(
+            j=args.j,
+            dir_name=args.data_dir,
+            angles_per_scale=args.angles_per_scale,
+            image_size=args.final_size,
+            limit=None,  # full set
+        )
+        np.savez(os.path.join(results_dir, f"curvelet_stats_j{args.j}.npz"),
+                 mean=mean.numpy(), std=std.numpy())
+
+        env = _env_with_repo_on_path()
+        repo_root = os.path.abspath(os.path.dirname(__file__))
+
+        # 1) Train coarse (unconditional) at this scale
         print(f"Training coarse model (scale {args.j})...")
-        subprocess.run([
-            "python", "scripts/image_train.py",
-            "--task", "curvelet", "--j", str(args.j), "--conditional", "False",
-            "--data_dir", args.data_dir, "--lr", str(args.lr),
-            "--batch_size", str(args.batch_size), "--angles_per_scale", args.angles_per_scale
-        ], check=True)
-        # Find last checkpoint
-        ckpts = sorted(glob.glob(os.path.join(log_dir, "*.pt")))
-        model_paths[f"coarse_J{args.j}"] = ckpts[-1] if ckpts else None
-        # Train conditional models for each scale
-        for scale in range(args.j, 0, -1):
-            log_dir = os.path.join(results_dir, f"curvelet_detail_j{scale}")
-            os.makedirs(log_dir, exist_ok=True)
-            print(f"Training detail model for scale {scale}...")
-            subprocess.run([
-                "python", "scripts/image_train.py",
-                "--task", "curvelet", "--j", str(scale), "--conditional", "True",
-                "--data_dir", args.data_dir, "--lr", str(args.lr),
-                "--batch_size", str(args.batch_size), "--angles_per_scale", args.angles_per_scale
-            ], check=True)
-            ckpts = sorted(glob.glob(os.path.join(log_dir, "*.pt")))
-            model_paths[f"detail_j{scale}"] = ckpts[-1] if ckpts else None
-
-    elif args.task == "wavelet":
-        # Similar block for wavelet (omitted for brevity)
-        pass
-
-    # Sampling
-    samples_dir = os.path.join(results_dir, "samples")
-    os.makedirs(samples_dir, exist_ok=True)
-    if args.task == "curvelet":
-        # Sample coarse first
-        coarse_out = os.path.join(samples_dir, f"coarse_J{args.j}")
-        os.makedirs(coarse_out, exist_ok=True)
-        print("Sampling coarsest images...")
-        subprocess.run([
-            "python", "scripts/image_sample.py",
-            "--task", "curvelet", "--j", str(args.j), "--conditional", "False",
+        cmd_coarse = [
+            sys.executable, "scripts/image_train.py",
+            "--task", "curvelet",
+            "--j", str(args.j),
+            "--conditional", "False",
             "--data_dir", args.data_dir,
-            "--model_path", model_paths.get(f"coarse_J{args.j}", ""),
-            "--output_dir", coarse_out,
-            "--num_samples", str(args.num_samples),
-            "--batch_size", str(min(args.batch_size, args.num_samples)),
-            "--image_size", str(final_size)
-        ], check=True)
-        # Iteratively sample each detail scale
-        current_dir = coarse_out
-        for scale in range(args.j, 0, -1):
-            detail_out = os.path.join(samples_dir, f"detail_j{scale}")
-            os.makedirs(detail_out, exist_ok=True)
-            print(f"Sampling detail scale {scale}...")
-            subprocess.run([
-                "python", "scripts/image_sample.py",
-                "--task", "curvelet", "--j", str(scale), "--conditional", "True",
-                "--data_dir", args.data_dir,
-                "--model_path", model_paths.get(f"detail_j{scale}", ""),
-                "--cond_dir", current_dir, "--output_dir", detail_out,
-                "--angles_per_scale", args.angles_per_scale
-            ], check=True)
-            current_dir = detail_out
-        print(f"Final images saved in {current_dir}")
-    elif args.task == "wavelet":
-        # Similar multi-stage sampling for wavelet (omitted)
-        pass
+            "--lr", str(args.lr),
+            "--batch_size", str(args.batch_size),
+            "--angles_per_scale", args.angles_per_scale or "",
+            "--large_size", str(args.final_size),
+            "--small_size", str(args.final_size),
+        ]
+        subprocess.run(cmd_coarse, check=True, cwd=repo_root, env=env)
 
-    print("Done. You can compute FID on the final images folder if desired.")
+        # 2) Train wedges (conditional) at this scale
+        print(f"Training conditional (wedges) model (scale {args.j})...")
+        cmd_cond = [
+            sys.executable, "scripts/image_train.py",
+            "--task", "curvelet",
+            "--j", str(args.j),
+            "--conditional", "True",
+            "--data_dir", args.data_dir,
+            "--lr", str(args.lr),
+            "--batch_size", str(args.batch_size),
+            "--angles_per_scale", args.angles_per_scale or "",
+            "--large_size", str(args.final_size),
+            "--small_size", str(args.final_size),
+        ]
+        subprocess.run(cmd_cond, check=True, cwd=repo_root, env=env)
+
+        # 3) Sample
+        print("Sampling...")
+        cmd_sample = [
+            sys.executable, "scripts/image_sample.py",
+            "--task", "curvelet",
+            "--j", str(args.j),
+            "--angles_per_scale", args.angles_per_scale or "",
+            "--data_dir", args.data_dir,
+            "--num_samples", str(args.num_samples),
+            "--large_size", str(args.final_size),
+            "--small_size", str(args.final_size),
+        ]
+        subprocess.run(cmd_sample, check=True, cwd=repo_root, env=env)
+
+    else:
+        raise NotImplementedError("This runner currently wires the curvelet task only.")
+
 
 if __name__ == "__main__":
     main()
