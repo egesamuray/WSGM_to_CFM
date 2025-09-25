@@ -1,163 +1,228 @@
 # improved_diffusion/curvelet_datasets.py
 import os
-import math
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from improved_diffusion import curvelet_ops
+import glob
+from typing import Iterable, List, Optional, Tuple
 
-# Utility: compute or load per-channel mean and std for given scale
-def curvelet_stats(j, data_dir, angles_per_scale=None):
-    stats_file = os.path.join(data_dir, f"curvelet_stats_j{j}.npz")
-    if os.path.exists(stats_file):
-        data = np.load(stats_file)
-        mean = data['mean']; std = data['std']
-        return mean, std
-    # Otherwise, compute stats by iterating dataset images
-    # We assume images in data_dir (png/jpg files).
-    import glob
-    image_paths = sorted(glob.glob(os.path.join(data_dir, "*")))
-    if len(image_paths) == 0:
-        raise FileNotFoundError(f"No images found in {data_dir}")
-    sum_channels = None
-    sum_squares = None
-    n_pixels = 0
-    # For each image, get curvelet coefficients at scale j
-    for path in image_paths:
-        from PIL import Image
-        img = Image.open(path).convert('RGB')
-        img = np.array(img).astype(np.float32) / 127.5 - 1.0  # [-1,1]
-        img_tensor = torch.from_numpy(img.transpose((2,0,1))).unsqueeze(0)  # (1,3,H,W)
-        # Compute coefficients
-        H, W = img_tensor.shape[-2:]
-        # Determine J as max scale available
-        J_max = math.floor(math.log2(min(H, W)))
-        if j > J_max:
-            raise ValueError(f"Requested scale j={j} but image too small for that many scales.")
-        coeffs = curvelet_ops.fdct2(img_tensor, J= j if angles_per_scale is None else len(angles_per_scale), angles_per_scale=angles_per_scale)
-        # Pack coarse+high at scale j
-        if j == coeffs['meta']['angles_per_scale'].__len__():  # if j corresponds to coarsest scale
-            # For coarsest scale, "highfreq" is none; just coarse
-            packed = coeffs['coarse']
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+
+from .curvelet_ops import fdct2, pack_highfreq
+
+
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+
+def _list_images(root: str) -> List[str]:
+    root = os.path.expanduser(root)
+    paths: List[str] = []
+    for ext in _IMG_EXTS:
+        paths.extend(glob.glob(os.path.join(root, f"*{ext}")))
+    paths.sort()
+    if not paths:
+        raise FileNotFoundError(f"No images found under: {root}")
+    return paths
+
+
+def _make_transform(image_size: Optional[int]) -> T.Compose:
+    tfms: List[torch.nn.Module] = []
+    if image_size is not None:
+        tfms.append(T.Resize((image_size, image_size), interpolation=T.InterpolationMode.BICUBIC))
+    tfms.extend([T.ToTensor(), T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])  # -> [-1,1]
+    return T.Compose(tfms)
+
+
+def _angles_parse(angles_per_scale: Optional[Iterable[int] or str]) -> Optional[List[int]]:
+    if angles_per_scale is None:
+        return None
+    if isinstance(angles_per_scale, (list, tuple)):
+        return [int(x) for x in angles_per_scale]
+    s = str(angles_per_scale).strip()
+    if not s:
+        return None
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _wedges_at_scale(j: int, angles_per_scale: Optional[List[int]]) -> int:
+    if not angles_per_scale or j is None or j <= 0:
+        return 1
+    # angles are coarsest -> finest; j=1 is finest
+    idx = -min(j, len(angles_per_scale))
+    return int(angles_per_scale[idx])
+
+
+@torch.no_grad()
+def curvelet_stats(
+    j: int,
+    dir_name: str,
+    angles_per_scale: Optional[Iterable[int] or str] = None,
+    image_size: Optional[int] = None,
+    limit: Optional[int] = None,
+    device: Optional[str] = None,
+):
+    """
+    Compute dataset mean/std over channels of [coarse || packed_wedges_at_scale(j)].
+    Returns mean, std (C,), where C = 3 + 3*W_j.
+    """
+    paths = _list_images(dir_name)
+    if limit is not None:
+        paths = paths[: int(limit)]
+
+    angles = _angles_parse(angles_per_scale)
+    J = len(angles) if angles else max(j, 3)
+    W_j = _wedges_at_scale(j, angles)
+
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    tfm = _make_transform(image_size)
+
+    sum_c = None
+    sumsq_c = None
+    count = 0
+
+    def _accumulate(vec_2d: torch.Tensor):
+        nonlocal sum_c, sumsq_c, count
+        if sum_c is None:
+            sum_c = vec_2d.sum(dim=1)
+            sumsq_c = (vec_2d ** 2).sum(dim=1)
         else:
-            packed = curvelet_ops.pack_highfreq(coeffs, j)
-            # Prepend coarse as condition channels
-            coarse = coeffs['coarse']
-            # Find coarse at that scale j (coarse_j is actually coeffs['coarse'] if j==J, else need to get intermediate coarse?)
-            # Here assume if j<max, then we need to get coarse_j by partial inverse? Simplify by computing full transform to get exact coarse_j:
-            # Actually fdct2 returns only final coarse (scale J). For j< J, coarse_j is accessible via iterative transform sequence, but not directly returned.
-            # We can get coarse_j by reconstructing up to that scale:
-            # Reconstruct coarse_{j} by using coarse_final and adding all bands from final up to j+1:
-            if j < coeffs['meta']['angles_per_scale'].__len__():
-                # Partial inverse: add back bands beyond scale j
-                full_img = curvelet_ops.ifdct2(coeffs)
-                # Now redo transform up to scale j only
-                coeffs_j = curvelet_ops.fdct2(full_img, J=j, angles_per_scale=coeffs['meta']['angles_per_scale'][-j:])
-                coarse_j = coeffs_j['coarse']
-            else:
-                coarse_j = coeffs['coarse']
-            packed = torch.cat([coarse_j, packed], dim=1)
-        arr = packed.squeeze(0).cpu().numpy()  # shape (C, N_j, N_j)
-        C_tot = arr.shape[0]
-        # Flatten spatial and accumulate
-        if sum_channels is None:
-            sum_channels = np.zeros(C_tot, dtype=np.float64)
-            sum_squares = np.zeros(C_tot, dtype=np.float64)
-        # mean over spatial dims
-        arr_flat = arr.reshape(C_tot, -1)
-        sum_channels += arr_flat.sum(axis=1)
-        sum_squares += (arr_flat**2).sum(axis=1)
-        n_pixels += arr_flat.shape[1]
-    mean = sum_channels / n_pixels
-    var = sum_squares / n_pixels - mean**2
-    std = np.sqrt(np.maximum(var, 1e-8))
-    np.savez(stats_file, mean=mean, std=std)
-    return mean, std
+            sum_c += vec_2d.sum(dim=1)
+            sumsq_c += (vec_2d ** 2).sum(dim=1)
+        count += vec_2d.size(1)
+
+    print(f"Computing stats for scale {j} (W_j={W_j}) on {len(paths)} images...")
+
+    for p in paths:
+        img = Image.open(p).convert("RGB")
+        x = tfm(img).unsqueeze(0).to(dev)  # (1,3,H,W)
+
+        coeffs = fdct2(x, J=J, angles_per_scale=angles)
+        coarse = coeffs["coarse"]            # (1,3,Hc,Wc)
+        packed = pack_highfreq(coeffs, j)    # (1,3*W_j,Hp,Wp)
+
+        # Align coarse to wedge spatial size
+        if coarse.shape[-2:] != packed.shape[-2:]:
+            coarse = F.interpolate(coarse, size=packed.shape[-2:], mode="bilinear", align_corners=False)
+
+        combo = torch.cat([coarse, packed], dim=1)  # (1, 3+3*W_j, H, W)
+        C = combo.size(1)
+        combo_flat = combo.view(C, -1)
+        _accumulate(combo_flat)
+
+    assert sum_c is not None and count > 0, "No pixels accumulated for stats."
+    mean = sum_c / count
+    var = sumsq_c / count - mean ** 2
+    std = torch.sqrt(var.clamp_min(1e-12))
+
+    return mean.cpu(), std.cpu()
+
 
 class CurveletDataset(Dataset):
-    def __init__(self, data_dir, j, conditional=True, angles_per_scale=None):
-        self.data_dir = data_dir
-        self.j = j
-        self.conditional = conditional
-        self.angles_per_scale = angles_per_scale
-        # Load or compute stats
-        self.mean, self.std = curvelet_stats(j, data_dir, angles_per_scale)
-        # List image files
-        import glob
-        self.files = sorted(glob.glob(os.path.join(data_dir, "*")))
-        # Precompute all coefficients and store in memory or disk shards for performance
-        # Here, for simplicity, we will compute on the fly in __getitem__ (can be cached externally).
-    def __len__(self):
-        return len(self.files)
-    def __getitem__(self, idx):
-        path = self.files[idx]
-        from PIL import Image
-        img = Image.open(path).convert('RGB')
-        img = np.array(img).astype(np.float32) / 127.5 - 1.0  # [-1,1] normalized
-        img_tensor = torch.from_numpy(img.transpose(2,0,1)).unsqueeze(0)  # (1,3,H,W)
-        # Compute full curvelet coeffs
-        coeffs = curvelet_ops.fdct2(img_tensor, J=self.j if self.angles_per_scale is None else len(self.angles_per_scale), angles_per_scale=self.angles_per_scale)
-        if self.conditional:
-            # Get coarse image at scale j and packed high-freq wedges
-            if self.j == len(coeffs['bands']):
-                # If j is coarsest scale, no high-freq (this is odd case - unconditional scenario normally)
-                coarse = coeffs['coarse']
-                high = None
-            else:
-                # Pack high-frequency at scale j
-                high = curvelet_ops.pack_highfreq(coeffs, self.j)
-                # Extract coarse_j: reconstruct coarse_j (the conditional input image)
-                if self.j < len(coeffs['bands']):
-                    # Partial recon to get coarse_j
-                    # We can reconstruct the image up to scale j (which yields coarse_{j})
-                    # Instead, simpler: take the next band (j+1) coarse directly from transform.
-                    # Actually not directly in coeffs, so we do partial ifdct:
-                    img_up_to_j = curvelet_ops.ifdct2({'coarse': coeffs['coarse'], 'bands': coeffs['bands'][:len(coeffs['bands'])- (self.j)]})
-                    # Now downsample that image to needed coarse size
-                    # Actually img_up_to_j is coarse_{j} as image
-                    coarse_size = high.shape[-1]  # N_j
-                    coarse_img = torch.nn.functional.interpolate(img_up_to_j, size=(coarse_size, coarse_size), mode='area')
-                    coarse = coarse_img
-                else:
-                    coarse = coeffs['coarse']
-            # Concatenate coarse (3 ch) and high (3*W_j ch) along channel
-            if high is not None:
-                combined = torch.cat([coarse, high], dim=1)  # shape (1, 3+3*W_j, N_j, N_j)
-            else:
-                combined = coarse
-            # Whiten channels
-            combined_np = combined.squeeze(0).cpu().numpy()
-            # Apply channel-wise normalization
-            combined_np = (combined_np - self.mean[:, None, None]) / self.std[:, None, None]
-            combined_tensor = torch.from_numpy(combined_np).float()
-            return combined_tensor
-        else:
-            # Unconditional: just coarse_J image
-            coarse = coeffs['coarse']  # (1,3,N_J,N_J)
-            coarse_np = coarse.squeeze(0).cpu().numpy()
-            coarse_np = (coarse_np - self.mean[:3, None, None]) / self.std[:3, None, None]  # first 3 channels are coarse
-            coarse_tensor = torch.from_numpy(coarse_np).float()
-            return coarse_tensor
+    """
+    If conditional=True: X = packed wedges (whitened), KW = {'conditioning': coarse}
+    else               : X = coarse, KW = {}
+    """
+    def __init__(
+        self,
+        image_dir: str,
+        image_size: Optional[int] = None,
+        j: int = 1,
+        conditional: bool = True,
+        angles_per_scale: Optional[Iterable[int] or str] = None,
+        stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        device: Optional[str] = None,
+    ):
+        super().__init__()
+        self.paths = _list_images(image_dir)
+        self.image_size = int(image_size) if image_size is not None else None
+        self.j = int(j)
+        self.conditional = bool(conditional)
+        self.angles = _angles_parse(angles_per_scale)
+        self.dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.tfm = _make_transform(self.image_size)
 
-def load_data_curvelet(data_dir, batch_size, j, conditional=True, angles_per_scale=None, deterministic=False):
-    """
-    Returns a PyTorch DataLoader or generator that yields curvelet coefficient data.
-    If conditional=True, yields (high_coeff_tensor, coarse_cond_tensor) for scale j.
-    If conditional=False, yields coarse images for scale j.
-    """
-    dataset = CurveletDataset(data_dir, j, conditional=conditional, angles_per_scale=angles_per_scale)
-    # We can use a DataLoader for deterministic order or infinite generator as needed.
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=not deterministic, drop_last=True)
-    if conditional:
-        # Wrap to yield tuple (high, coarse) splitting channels
-        for batch in loader:
-            # batch shape (batch_size, C_total, N_j, N_j)
-            C_total = batch.shape[1]
-            coarse_channels = 3
-            high_channels = C_total - 3
-            coarse_batch = batch[:, 0:3, ...]
-            high_batch = batch[:, 3:, ...]
-            yield high_batch, coarse_batch
-    else:
-        for batch in loader:
-            yield batch
+        if stats is None and self.conditional:
+            with torch.no_grad():
+                mean, std = curvelet_stats(
+                    j=self.j,
+                    dir_name=image_dir,
+                    angles_per_scale=self.angles,
+                    image_size=self.image_size,
+                    limit=min(256, len(self.paths)),
+                    device=self.dev,
+                )
+        elif stats is not None:
+            mean, std = stats
+        else:
+            mean, std = None, None
+        self.mean = mean
+        self.std = std
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx: int):
+        p = self.paths[idx]
+        img = Image.open(p).convert("RGB")
+        x = self.tfm(img).unsqueeze(0).to(self.dev)  # (1,3,H,W)
+
+        coeffs = fdct2(x, J=(len(self.angles) if self.angles else max(self.j, 3)), angles_per_scale=self.angles)
+        coarse = coeffs["coarse"]         # (1,3,Hc,Wc)
+        packed = pack_highfreq(coeffs, self.j)  # (1,3*W_j,Hp,Wp)
+
+        if coarse.shape[-2:] != packed.shape[-2:]:
+            coarse = F.interpolate(coarse, size=packed.shape[-2:], mode="bilinear", align_corners=False)
+
+        if self.conditional:
+            X = packed[0]  # (3*W_j,H,W)
+            if self.mean is not None and self.std is not None:
+                Wj = packed.size(1) // 3
+                start = 3
+                mean_w = self.mean[start:start + 3 * Wj].view(-1, 1, 1).to(self.dev)
+                std_w = self.std[start:start + 3 * Wj].view(-1, 1, 1).to(self.dev).clamp_min(1e-6)
+                X = (X - mean_w) / std_w
+            KW = {"conditioning": coarse[0]}
+        else:
+            X = coarse[0]
+            KW = {}
+
+        return X, KW
+
+
+def load_data_curvelet(
+    data_dir: str,
+    batch_size: int,
+    j: int,
+    conditional: bool,
+    image_size: Optional[int] = None,  # now optional
+    angles_per_scale: Optional[Iterable[int] or str] = None,
+    stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    deterministic: bool = False,
+    num_workers: int = 2,
+):
+    ds = CurveletDataset(
+        image_dir=data_dir,
+        image_size=image_size,
+        j=j,
+        conditional=conditional,
+        angles_per_scale=angles_per_scale,
+        stats=stats,
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=not deterministic,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    def _gen():
+        while True:
+            for X, KW in loader:
+                yield X, {k: v for k, v in KW.items()}
+
+    return _gen()
