@@ -1,68 +1,120 @@
 # scripts/image_train.py
-import os
-import torch
-from improved_diffusion import script_util
-from improved_diffusion import wavelet_datasets, curvelet_datasets
+"""
+Train a diffusion model on images.
+"""
+
+import argparse
+import json
+
+from improved_diffusion import dist_util, logger
+from improved_diffusion.image_datasets import load_data
+from improved_diffusion.wavelet_datasets import load_data_wavelet
+from improved_diffusion.script_util import (
+    model_and_diffusion_defaults,
+    create_model_and_diffusion,
+    args_to_dict,
+    add_dict_to_argparser,
+)
+from improved_diffusion.train_util import TrainLoop
+
+# (NEW)
+from improved_diffusion.curvelet_datasets import load_data_curvelet
+
 
 def main():
-    args = script_util.create_argparser().parse_args()
-    # Derive device once and attach for convenience
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = create_argparser().parse_args()
 
-    # Update model channels for wavelet/curvelet tasks
-    script_util.update_model_channels(args)
+    dist_util.setup_dist()
+    logger.configure()
 
-    # Create model & diffusion (works with args-namespace now)
-    model, diffusion = script_util.create_model_and_diffusion(args)
-    model.to(dev)
-    # convenience: some code expects model.device
-    setattr(model, "device", dev)
+    with open(f"{logger.get_dir()}/args.json", 'w') as f:
+        json.dump(args.__dict__, f, indent=2)
 
-    # Prepare data loader
-    if args.task == "wavelet":
-        data = wavelet_datasets.load_data_wavelet(
-            args.data_dir, args.batch_size, args.j,
-            conditional=args.conditional, deterministic=False
+    logger.log("creating model and diffusion...")
+    model, diffusion = create_model_and_diffusion(
+        task=args.task, **args_to_dict(args, model_and_diffusion_defaults(task=args.task).keys()),
+    )
+    model.to(dist_util.dev())
+
+    logger.log("creating data loader...")
+    if args.task == "standard":
+        data = load_data(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            image_size=args.large_size,
+            class_cond=args.class_cond,
         )
-    elif args.task == "curvelet":
-        data = curvelet_datasets.load_data_curvelet(
-            args.data_dir, args.batch_size, args.j,
+    elif args.task == "super_res":
+        data = load_data(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            image_size=args.large_size,
+            class_cond=args.class_cond,
+        )
+    elif args.task == "wavelet":
+        data = load_data_wavelet(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            j=args.j,
             conditional=args.conditional,
-            angles_per_scale=[int(a) for a in args.angles_per_scale.split(',')] if args.angles_per_scale else None,
-            deterministic=False
+        )
+    elif args.task == "curvelet":  # NEW
+        data = load_data_curvelet(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            j=args.j,
+            conditional=args.conditional,
+            angles_per_scale=args.angles_per_scale,
+            image_size=args.large_size,
         )
     else:
-        # Fallback (not used in your current runs)
-        from improved_diffusion import image_datasets as datasets
-        data = datasets.load_data(data_dir=args.data_dir, batch_size=args.batch_size, image_size=args.large_size, class_cond=False)
+        assert False
 
-    # Training loop (toy)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    for step, batch in enumerate(data):
-        model.train()
-        optimizer.zero_grad()
+    logger.log("training...")
+    TrainLoop(
+        model=model,
+        diffusion=diffusion,
+        data=data,
+        batch_size=args.batch_size,
+        microbatch=args.microbatch,
+        lr=args.lr,
+        ema_rate=args.ema_rate,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
+        resume_checkpoint=args.resume_checkpoint,
+        use_fp16=args.use_fp16,
+        fp16_scale_growth=args.fp16_scale_growth,
+        schedule_sampler=diffusion.schedule,
+        weight_decay=args.weight_decay,
+        lr_anneal_steps=args.lr_anneal_steps,
+        max_training_steps=args.max_training_steps,
+    ).run_loop()
 
-        if args.task in ["wavelet", "curvelet"] and args.conditional:
-            high_freq, cond = batch  # tuple from generator
-            high_freq = high_freq.to(dev)
-            cond = cond.to(dev)
-            model_kwargs = {"low_res": cond}
-            losses = diffusion.training_losses(model, high_freq, model_kwargs=model_kwargs)
-        else:
-            batch = batch.to(dev)
-            losses = diffusion.training_losses(model, batch)
 
-        loss = losses["loss"].mean()
-        loss.backward()
-        optimizer.step()
+def create_argparser():
+    defaults = dict(
+        task="standard",
+        data_dir="",
+        schedule_sampler="uniform",
+        lr=1e-4,
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        max_training_steps=500000,
+        batch_size=1,
+        microbatch=-1,  # -1 disables microbatches
+        ema_rate="0.9999",  # comma-separated list of EMA values
+        log_interval=10,
+        save_interval=10000,
+        resume_checkpoint="",
+        use_fp16=False,
+        fp16_scale_growth=1e-3,
+    )
+    # Pull in model/diffusion defaults (now includes angles_per_scale + j + conditional)
+    defaults.update(model_and_diffusion_defaults(task=defaults["task"]))
+    parser = argparse.ArgumentParser()
+    add_dict_to_argparser(parser, defaults)
+    return parser
 
-        if args.save_interval and step % args.save_interval == 0:
-            save_dir = os.environ.get("OPENAI_LOGDIR", "")
-            os.makedirs(save_dir or ".", exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(save_dir or ".", f"model_{step:06d}.pt"))
-
-        if step >= args.iterations:
-            break
 
 if __name__ == "__main__":
     main()
