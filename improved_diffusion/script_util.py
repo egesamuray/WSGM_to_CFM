@@ -8,38 +8,33 @@ from .unet import SuperResModel, UNetModel, ConditionalModel
 NUM_CLASSES = 1000
 
 """
-In this file, the argument `task` represents the task performed by the model:
+Tasks:
 - "standard": unconditional denoising
-- "super_res": super-resolution (denoising conditioned on low-resolution input)
-- "wavelet": denoising of high-frequencies conditioned on low-frequencies
-- "curvelet": denoising of curvelet high-frequency wedges conditioned on the coarse image
+- "super_res": upsampling/conditional denoising
+- "wavelet": denoise wavelet high-freqs conditioned on low-freqs
+- "curvelet": denoise curvelet wedges conditioned on coarse
 """
 
 
 # ------------------------------- Defaults ------------------------------------
-
-
 def model_and_diffusion_defaults(task: str = "standard"):
     """
-    Defaults for image training. For `super_res`, we keep a larger default `large_size`.
-    For other tasks, defaults mirror the original repo.
+    Defaults for image training. For `super_res`, keep a larger default `large_size`.
     """
     large_size = 256 if task == "super_res" else 64
     small_size = 64 if task == "super_res" else 64
 
     return dict(
-        # Task-specific spatial defaults
+        # Spatial
         large_size=large_size,
         small_size=small_size,
 
-        # Multiscale controls
-        j=0,                      # Scale for wavelet/curvelet (1 = finest, coarser as j increases). Kept 0 for BC.
-        conditional=True,         # For wavelet/curvelet: True => predict high-freq given coarse; False => unconditional coarse
+        # Multiscale
+        j=0,                      # 1=finest in our curvelet/wavelet convention (kept 0 for BC with older scripts)
+        conditional=True,         # for wavelet/curvelet: HF given coarse vs unconditional coarse
+        angles_per_scale=None,    # "coarsest->finest", e.g. "8,16,16"
 
-        # (New) curvelet wedges per scale (string "8,16,32,32" from coarsest->finest). None => determine elsewhere.
-        angles_per_scale=None,
-
-        # UNet / attention hyperparameters
+        # UNet / attention
         channel_mult=None,
         num_channels=128,
         num_res_blocks=2,
@@ -48,7 +43,7 @@ def model_and_diffusion_defaults(task: str = "standard"):
         attention_resolutions="16,8",
         dropout=0.0,
 
-        # Diffusion / loss config
+        # Diffusion / losses
         learn_sigma=False,
         sigma_small=False,
         class_cond=False,
@@ -64,17 +59,11 @@ def model_and_diffusion_defaults(task: str = "standard"):
         use_checkpoint=False,
         use_scale_shift_norm=True,
         learn_potential=False,
-
-        # I/O channel hints (will be overridden by update_model_channels/create_model)
-        in_channels=3,
-        conditioning_channels=0,
     )
 
 
 # --------------------------- Model + Diffusion -------------------------------
-
-
-def create_model_and_diffusion(
+def _create_model_and_diffusion_core(
     task,
     large_size,
     small_size,
@@ -100,7 +89,7 @@ def create_model_and_diffusion(
     use_checkpoint,
     use_scale_shift_norm,
     learn_potential,
-    angles_per_scale=None,  # NEW: pass through to create_model for curvelet
+    angles_per_scale=None,  # accepts curvelet wedges list/str
 ):
     model = create_model(
         task=task,
@@ -120,7 +109,7 @@ def create_model_and_diffusion(
         use_scale_shift_norm=use_scale_shift_norm,
         dropout=dropout,
         learn_potential=learn_potential,
-        angles_per_scale=angles_per_scale,  # NEW
+        angles_per_scale=angles_per_scale,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -136,21 +125,37 @@ def create_model_and_diffusion(
     return model, diffusion
 
 
+def create_model_and_diffusion(*args, **kwargs):
+    """
+    Flexible wrapper:
+    - If called as create_model_and_diffusion(args_namespace), extract kwargs from defaults and build.
+    - If called with expanded kwargs (task=..., large_size=..., ...), pass through to the core builder.
+    """
+    # Namespace-style call: create_model_and_diffusion(args)
+    if len(args) == 1 and not kwargs and hasattr(args[0], "__dict__"):
+        ns = args[0]
+        task_val = getattr(ns, "task", "standard")
+        keys = model_and_diffusion_defaults(task=task_val).keys()
+        payload = args_to_dict(ns, keys)
+        return _create_model_and_diffusion_core(task=task_val, **payload)
+
+    # Kwarg-style call: create_model_and_diffusion(task=..., large_size=..., ...)
+    return _create_model_and_diffusion_core(*args, **kwargs)
+
+
 def _parse_angles(angles_per_scale):
     """
-    Accepts None | list[int] | str like "8,16,32,32".
+    Accepts None | list[int] | str like "8,16,32".
     Returns list[int] (coarsest -> finest) or None.
     """
     if angles_per_scale is None:
         return None
     if isinstance(angles_per_scale, (list, tuple)):
         return [int(x) for x in angles_per_scale]
-    if isinstance(angles_per_scale, str):
-        s = angles_per_scale.strip()
-        if not s:
-            return None
-        return [int(x.strip()) for x in s.split(",") if x.strip()]
-    raise TypeError("angles_per_scale must be None, list[int], or comma-separated string")
+    s = str(angles_per_scale).strip()
+    if not s:
+        return None
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
 def _wedges_at_scale(j: int, angles_per_scale):
@@ -160,9 +165,8 @@ def _wedges_at_scale(j: int, angles_per_scale):
     """
     angles = _parse_angles(angles_per_scale)
     if not angles or j is None or j <= 0:
-        return 1  # conservative fallback; pass explicit --angles_per_scale to set correctly
-    idx = -j
-    idx = max(-len(angles), idx)  # clamp
+        return 1
+    idx = max(-len(angles), -int(j))
     return int(angles[idx])
 
 
@@ -184,9 +188,9 @@ def create_model(
     use_scale_shift_norm,
     dropout,
     learn_potential,
-    angles_per_scale=None,  # NEW
+    angles_per_scale=None,
 ):
-    _ = small_size  # hack to prevent unused variable
+    _ = small_size
 
     if channel_mult is None:
         if large_size == 256:
@@ -198,12 +202,11 @@ def create_model(
         else:
             raise ValueError(f"unsupported large size: {large_size}")
     else:
-        # Convert "1,2,3" -> (1,2,3)
         channel_mult = tuple(map(int, channel_mult.split(",")))
 
     attention_ds = [large_size // int(res) for res in attention_resolutions.split(",")]
 
-    # Select model class by task
+    # pick model class
     if task == "standard":
         model_cls = UNetModel
     elif task == "super_res":
@@ -215,9 +218,8 @@ def create_model(
     else:
         raise ValueError(f"Unsupported task: {task}")
 
-    # Base kwargs
     kwargs = dict(
-        in_channels=3,  # will be overridden below for wavelet/curvelet conditional
+        in_channels=3,  # overridden below for wavelet/curvelet conditional
         model_channels=num_channels,
         in_space=large_size,
         num_res_blocks=num_res_blocks,
@@ -239,7 +241,7 @@ def create_model(
     # Curvelet conditional: 3 * W_j channels, conditioned on 3-channel coarse
     if task == "curvelet":
         if conditional:
-            W_j = _wedges_at_scale(j if j is not None else 1, angles_per_scale)
+            W_j = _wedges_at_scale(j if j else 1, angles_per_scale)
             kwargs.update(in_channels=3 * W_j, conditioning_channels=3)
         else:
             kwargs.update(in_channels=3, conditioning_channels=0)
@@ -283,10 +285,11 @@ def create_gaussian_diffusion(
 
 
 # ------------------------------- Argparse ------------------------------------
-
-
 def add_dict_to_argparser(parser, default_dict):
     for k, v in default_dict.items():
+        # Skip if an option with this name already exists (prevents duplicates).
+        if f"--{k}" in parser._option_string_actions:
+            continue
         v_type = type(v)
         if v is None:
             v_type = str
@@ -297,8 +300,8 @@ def add_dict_to_argparser(parser, default_dict):
 
 def args_to_dict(args, keys, j=0):
     """
-    Returns a dictionary of key=value from arguments and an iterable of keys.
-    Extracts the j-th item from list-valued arguments (nargs='+').
+    Return a dict of key=value from an argparse namespace for the given keys.
+    If a value is a list, take the j-th item.
     """
     def get_arg(k):
         arg = getattr(args, k)
@@ -309,10 +312,6 @@ def args_to_dict(args, keys, j=0):
 
 
 def str2bool(v):
-    """
-    Parse boolean values from strings.
-    https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
-    """
     if isinstance(v, bool):
         return v
     lv = v.lower()
@@ -325,8 +324,7 @@ def str2bool(v):
 
 def create_argparser():
     """
-    Convenience parser used by scripts. We first parse --task to obtain task-aware defaults,
-    then add the rest of the arguments.
+    We first parse --task to obtain task-aware defaults, then add the rest.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -341,7 +339,7 @@ def create_argparser():
     defaults = model_and_diffusion_defaults(task=known_args.task)
     add_dict_to_argparser(parser, defaults)
 
-    # Common script-level args (not consumed by create_model_and_diffusion)
+    # Script-level args (not consumed by create_model_and_diffusion core)
     parser.add_argument("--data_dir", type=str, default=None, help="Dataset directory")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -353,33 +351,23 @@ def create_argparser():
     parser.add_argument("--num_samples", type=int, default=16, help="Number of samples to generate (sampling)")
     parser.add_argument("--image_size", type=int, default=None, help="Full-resolution image size (sampling)")
 
-    # Optional help text for curvelet wedges (already added via defaults)
-    parser.add_argument(
-        "--angles_per_scale",
-        type=str,
-        default=defaults.get("angles_per_scale", None),
-        help="Comma-separated wedges per scale (coarsest->finest), e.g., '8,16,32,32'.",
-    )
+    # NOTE: do NOT re-add --angles_per_scale here; it already comes from defaults above.
     return parser
 
 
 # ------------------------ Task-aware channel updates -------------------------
-
-
 def update_model_channels(args):
     """
     Set args.in_channels / args.conditioning_channels / args.out_channels
-    based on the selected task. For curvelet, uses angles_per_scale to derive W_j
-    (number of wedges at scale j). If angles are unknown, uses a safe placeholder.
+    based on the selected task.
     """
-    # Defaults
     args.in_channels = getattr(args, "in_channels", 3)
     args.conditioning_channels = getattr(args, "conditioning_channels", 0)
     learn_sigma = getattr(args, "learn_sigma", False)
 
     if args.task == "wavelet":
         if args.conditional:
-            args.in_channels = 9  # 3 subbands × 3 colors
+            args.in_channels = 9    # 3 subbands × 3 colors
             args.conditioning_channels = 3
         else:
             args.in_channels = 3
@@ -387,13 +375,11 @@ def update_model_channels(args):
 
     elif args.task == "curvelet":
         if args.conditional:
-            # number of wedges at scale j:
             angles = _parse_angles(getattr(args, "angles_per_scale", None))
             if angles:
-                # angles are listed coarsest->finest; j=1 is finest
-                W_j = angles[-1] if len(angles) == 1 else angles[-max(1, int(args.j))]
+                # angles listed coarsest->finest; j=1 is finest
+                W_j = angles[-max(1, int(args.j))]
             else:
-                # Placeholder until stats/dataset define it explicitly
                 W_j = 1
             args.in_channels = 3 * int(W_j)
             args.conditioning_channels = 3
@@ -401,5 +387,4 @@ def update_model_channels(args):
             args.in_channels = 3
             args.conditioning_channels = 0
 
-    # Mirror input channels in output unless learning sigma
     args.out_channels = int(args.in_channels) * (2 if learn_sigma else 1)
