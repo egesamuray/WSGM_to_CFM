@@ -39,6 +39,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_samples", type=int, default=16)
+    p.add_argument("--color_channels", type=int, default=3)  # NEW
     return p.parse_args()
 
 
@@ -50,7 +51,7 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     print(f"Results will be saved to {results_dir}")
 
-    # 0) stats (CPU, safe)
+    # 0) stats (CPU)
     print(f"Computing stats for scale {args.j}...")
     mean, std = curvelet_datasets.curvelet_stats(
         j=args.j,
@@ -59,6 +60,7 @@ def main():
         image_size=args.final_size,
         limit=None,
         device="cpu",
+        color_channels=args.color_channels,
     )
     np.savez(os.path.join(results_dir, f"curvelet_stats_j{args.j}.npz"),
              mean=mean.numpy(), std=std.numpy())
@@ -82,6 +84,7 @@ def main():
         "--angles_per_scale", args.angles_per_scale or "",
         "--large_size", str(args.final_size),
         "--small_size", str(args.final_size),
+        "--color_channels", str(args.color_channels),
     ]
     subprocess.run(cmd_coarse, check=True, cwd=repo_root, env=env_coarse)
     coarse_ckpt = _latest_pt(coarse_logdir)
@@ -104,13 +107,14 @@ def main():
         "--angles_per_scale", args.angles_per_scale or "",
         "--large_size", str(args.final_size),
         "--small_size", str(args.final_size),
+        "--color_channels", str(args.color_channels),
     ]
     subprocess.run(cmd_cond, check=True, cwd=repo_root, env=env_cond)
     cond_ckpt = _latest_pt(cond_logdir)
     if not cond_ckpt:
         raise FileNotFoundError(f"No checkpoints found under {cond_logdir}")
 
-    # 3) sample final images end-to-end with both models
+    # 3) sample final images
     print("Sampling...")
     samples_dir = os.path.join(results_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
@@ -126,6 +130,7 @@ def main():
         "--coarse_model_path", coarse_ckpt,
         "--cond_model_path", cond_ckpt,
         "--output_dir", samples_dir,
+        "--color_channels", str(args.color_channels),
     ]
     subprocess.run(cmd_sample, check=True, cwd=repo_root, env=env)
 
@@ -134,4 +139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
