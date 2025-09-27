@@ -2,7 +2,6 @@
 """
 Train a diffusion model on images.
 """
-
 import argparse
 import json
 
@@ -17,7 +16,6 @@ from improved_diffusion.script_util import (
 )
 from improved_diffusion.train_util import TrainLoop
 
-# (NEW)
 from improved_diffusion.curvelet_datasets import load_data_curvelet
 
 
@@ -58,7 +56,7 @@ def main():
             j=args.j,
             conditional=args.conditional,
         )
-    elif args.task == "curvelet":  # NEW
+    elif args.task == "curvelet":
         data = load_data_curvelet(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
@@ -66,9 +64,10 @@ def main():
             conditional=args.conditional,
             angles_per_scale=args.angles_per_scale,
             image_size=args.large_size,
+            color_channels=args.color_channels,  # NEW
         )
     else:
-        assert False
+        raise ValueError("unsupported task")
 
     logger.log("training...")
     TrainLoop(
@@ -101,15 +100,14 @@ def create_argparser():
         lr_anneal_steps=0,
         max_training_steps=500000,
         batch_size=1,
-        microbatch=-1,  # -1 disables microbatches
-        ema_rate="0.9999",  # comma-separated list of EMA values
+        microbatch=-1,
+        ema_rate="0.9999",
         log_interval=10,
         save_interval=10000,
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
     )
-    # Pull in model/diffusion defaults (now includes angles_per_scale + j + conditional)
     defaults.update(model_and_diffusion_defaults(task=defaults["task"]))
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)
