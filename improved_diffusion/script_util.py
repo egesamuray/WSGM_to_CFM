@@ -8,13 +8,12 @@ from .unet import SuperResModel, UNetModel, ConditionalModel
 NUM_CLASSES = 1000
 
 """
-In all this file, the argument `task` represent the task the model performs. It can be:
+In all this file, the argument `task` represents the task the model performs. It can be:
 - "standard": unconditional denoising
-- "super_res": super-resolution, i.e., denoising conditioned on low-resolution
+- "super_res": super-resolution (denoising conditioned on low-resolution input)
 - "wavelet": denoising of high-frequencies conditioned on low-frequencies
 - "curvelet": denoising of curvelet wedges conditioned on coarse (NEW)
 """
-
 
 def model_and_diffusion_defaults(task="standard"):
     """
@@ -24,8 +23,8 @@ def model_and_diffusion_defaults(task="standard"):
         large_size=256 if task == "super_res" else 64,
         small_size=64 if task == "super_res" else 64,
         j=0,                         # Scale index (1 = finest) used for multiscale tasks.
-        conditional=True,            # Whether we predict HF given LF (True) or train LF unconditional (False).
-        angles_per_scale=None,       # (NEW) Curvelet: wedges per scale, coarsest->finest, e.g. "8,16,16".
+        conditional=True,            # Whether to predict HF given LF (True) or train LF unconditional (False).
+        angles_per_scale=None,       # (NEW) Curvelet: wedges per scale, coarsest->finest (e.g., "8,16,16").
         channel_mult=None,
         num_channels=128,
         num_res_blocks=2,
@@ -47,7 +46,6 @@ def model_and_diffusion_defaults(task="standard"):
         use_scale_shift_norm=True,
         learn_potential=False,
     )
-
 
 def create_model_and_diffusion(
     task,
@@ -75,7 +73,7 @@ def create_model_and_diffusion(
     use_checkpoint,
     use_scale_shift_norm,
     learn_potential,
-    angles_per_scale=None,  # NEW: plumb through
+    angles_per_scale=None,  # NEW parameter for curvelet
 ):
     model = create_model(
         task=task,
@@ -95,7 +93,7 @@ def create_model_and_diffusion(
         use_scale_shift_norm=use_scale_shift_norm,
         dropout=dropout,
         learn_potential=learn_potential,
-        angles_per_scale=angles_per_scale,  # NEW
+        angles_per_scale=angles_per_scale,  # NEW: pass through to model creation
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -110,10 +108,9 @@ def create_model_and_diffusion(
     )
     return model, diffusion
 
-
 def _parse_angles(angles_per_scale):
     """
-    Accepts None | list[int] | str like "8,16,32".
+    Accepts None, list[int], or str like "8,16,32".
     Returns list[int] (coarsest -> finest) or None.
     """
     if angles_per_scale is None:
@@ -125,18 +122,16 @@ def _parse_angles(angles_per_scale):
         return None
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
-
 def _wedges_at_scale(j: int, angles_per_scale):
     """
-    Given scale index j (1=finest), and angles_per_scale (coarsest->finest),
-    return W_j = angles_per_scale[-j]. If unavailable, fall back to 1.
+    Given scale index j (1=finest), and angles_per_scale list (coarsest->finest),
+    return W_j = angles_per_scale[-j]. Falls back to 1 if not applicable.
     """
     angles = _parse_angles(angles_per_scale)
     if not angles or j is None or j <= 0:
         return 1
     idx = max(-len(angles), -int(j))
     return int(angles[idx])
-
 
 def create_model(
     task,
@@ -158,8 +153,9 @@ def create_model(
     learn_potential,
     angles_per_scale=None,  # NEW
 ):
-    _ = small_size  # kept for BC
-
+    _ = small_size  # kept for backward compatibility
+    
+    # Determine channel multiplier if not provided
     if channel_mult is None:
         if large_size == 256:
             channel_mult = (1, 1, 2, 2, 4, 4)
@@ -170,12 +166,13 @@ def create_model(
         else:
             raise ValueError(f"unsupported large size: {large_size}")
     else:
-        channel_mult = tuple(map(int, channel_mult.split(',')))  # "1,2,3" -> (1,2,3)
-
+        channel_mult = tuple(map(int, channel_mult.split(',')))  # e.g., "1,2,3" -> (1,2,3)
+    
+    # Compute attention resolutions (in downsample factors)
     attention_ds = []
     for res in attention_resolutions.split(","):
         attention_ds.append(large_size // int(res))
-
+    
     # Select model class by task
     if task == "standard":
         model_cls = UNetModel
@@ -187,8 +184,8 @@ def create_model(
         model_cls = ConditionalModel if conditional else UNetModel
     else:
         assert False
-
-    # Base kwargs valid for both UNetModel and ConditionalModel
+    
+    # Base kwargs common to both UNetModel and ConditionalModel
     kwargs = dict(
         in_channels=3,
         model_channels=num_channels,
@@ -204,14 +201,13 @@ def create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         learn_potential=learn_potential,
     )
-
     # Wavelet conditional: 3 subbands × 3 colors = 9 channels, conditioned on 3-channel coarse
     if task == "wavelet" and conditional:
         kwargs.update(in_channels=9)
         # Only ConditionalModel accepts this kwarg
         kwargs["conditioning_channels"] = 3
-
-    # Curvelet conditional: 3 * W_j channels, conditioned on 3-channel coarse
+    
+    # Curvelet conditional: 3 * W_j input channels, conditioned on 3-channel coarse
     if task == "curvelet":
         if conditional:
             W_j = _wedges_at_scale(j if j else 1, angles_per_scale)
@@ -219,19 +215,17 @@ def create_model(
             # Only ConditionalModel accepts this kwarg
             kwargs["conditioning_channels"] = 3
         else:
-            # UNetModel for coarse: DO NOT pass conditioning_channels
+            # Coarse (unconditional) model: do not set conditioning_channels
             kwargs.update(in_channels=3)
-
-    # Output channels mirror input channels unless learning sigma
+    
+    # Output channels mirror input channels unless learning sigma (doubles channels)
     kwargs.update(out_channels=kwargs["in_channels"] * (2 if learn_sigma else 1))
-
     return model_cls(**kwargs)
-
 
 def create_gaussian_diffusion(
     *,
     steps=-1,
-    final_time=5.,
+    final_time=5.0,
     learn_sigma=False,
     sigma_small=False,
     noise_schedule="linear",
@@ -240,6 +234,7 @@ def create_gaussian_diffusion(
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
 ):
+    # Choose appropriate loss type
     if use_kl:
         loss_type = gd.LossType.RESCALED_KL
     elif rescale_learned_sigmas:
@@ -254,20 +249,18 @@ def create_gaussian_diffusion(
         ),
         model_var_type=(
             (
-                gd.ModelVarType.FIXED_LARGE
-                if not sigma_small
-                else gd.ModelVarType.FIXED_SMALL
-            )
-            if not learn_sigma
-            else gd.ModelVarType.LEARNED_RANGE
+                gd.ModelVarType.FIXED_LARGE if not sigma_small else gd.ModelVarType.FIXED_SMALL
+            ) if not learn_sigma else gd.ModelVarType.LEARNED_RANGE
         ),
         loss_type=loss_type,
         rescale_timesteps=rescale_timesteps,
     )
 
-
 def add_dict_to_argparser(parser, default_dict):
     for k, v in default_dict.items():
+        # Skip adding if this argument was already added (avoids duplicate flags)
+        if f"--{k}" in parser._option_string_actions:
+            continue
         v_type = type(v)
         if v is None:
             v_type = str
@@ -275,21 +268,18 @@ def add_dict_to_argparser(parser, default_dict):
             v_type = str2bool
         parser.add_argument(f"--{k}", default=v, type=v_type)
 
-
 def args_to_dict(args, keys, j=0):
-    """ Returns a dictionary of key=value from arguments and an iterable of keys.
-    Extracts the j-th item from list-valued arguments (nargs='+'). """
+    """Convert argparse Namespace to a dict of key=value (handles list args by index `j`)."""
     def get_arg(k):
         arg = getattr(args, k)
         if isinstance(arg, list):
-            arg = arg[j]
+            return arg[j]
         return arg
     return {k: get_arg(k) for k in keys}
 
-
 def str2bool(v):
     """
-    https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
+    Parse boolean values from argparse arguments (e.g., "true"/"false").
     """
     if isinstance(v, bool):
         return v
