@@ -149,7 +149,7 @@ def main():
         for i in range(arr.shape[0]):
             if C == 1:
                 im = ((arr[i, 0] + 1.0) * 127.5).astype(np.uint8)
-                Image.fromarray(im, mode="L").save(os.path.join(outdir, f"sample_{done + i:06d}.png"))
+                Image.fromarray(im).save(os.path.join(outdir, f"sample_{done + i:06d}.png"))
             else:
                 im = ((arr[i].transpose(1, 2, 0) + 1.0) * 127.5).astype(np.uint8)
                 Image.fromarray(im).save(os.path.join(outdir, f"sample_{done + i:06d}.png"))
