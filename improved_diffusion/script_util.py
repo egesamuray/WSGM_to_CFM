@@ -248,16 +248,21 @@ def create_gaussian_diffusion(
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
 ):
+    """
+    Construct GaussianDiffusion with repo's expected signature and normalize
+    a couple of small differences between training and sampling call sites.
+    """
     if use_kl:
         loss_type = gd.LossType.RESCALED_KL
     elif rescale_learned_sigmas:
         loss_type = gd.LossType.RESCALED_MSE
     else:
         loss_type = gd.LossType.MSE
-    # >>> KEY FIX: The GaussianDiffusion expects 'num_timesteps', not 'num_diffusion_steps'
-    return gd.GaussianDiffusion(
+
+    # >>> IMPORTANT: this repo's GaussianDiffusion expects 'num_diffusion_steps'
+    diff = gd.GaussianDiffusion(
         schedule=ScheduleSampler(final_time=final_time, schedule=noise_schedule),
-        num_timesteps=steps,
+        num_diffusion_steps=steps,  # <-- correct kwarg for this codebase
         model_mean_type=(gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X),
         model_var_type=(
             (gd.ModelVarType.FIXED_LARGE if not sigma_small else gd.ModelVarType.FIXED_SMALL)
@@ -267,6 +272,20 @@ def create_gaussian_diffusion(
         loss_type=loss_type,
         rescale_timesteps=rescale_timesteps,
     )
+
+    # Compatibility guard: ensure 'num_timesteps' exists for p_sample_loop(_progressive)
+    # Sampling now passes a positive 'steps'; training can leave it -1 safely.
+    if not hasattr(diff, "num_timesteps"):
+        try:
+            # prefer an internal field if present; else use steps
+            val = getattr(diff, "num_diffusion_steps", None)
+            if val is None:
+                val = int(steps)
+            diff.num_timesteps = int(val) if int(val) > 0 else 0
+        except Exception:
+            pass
+
+    return diff
 
 
 # ------------------------------- Argparse ------------------------------------
