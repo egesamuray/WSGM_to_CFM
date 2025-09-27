@@ -39,9 +39,7 @@ def _steps_or_default(x, default_val=256):
 
 
 def main():
-    # Pull base args (includes --output_dir already)
     parser = script_util.create_argparser()
-    # Only add params not present in script_util to avoid argparse conflicts
     parser.add_argument("--coarse_model_path", type=str, default=None)
     parser.add_argument("--cond_model_path", type=str, default=None)
     args = parser.parse_args()
@@ -50,11 +48,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     angles = _angles_list(args.angles_per_scale)
+    C = int(args.color_channels)
     W_j = max(1, script_util._wedges_at_scale(args.j if args.j else 1, angles))
     full_size = args.large_size if args.large_size else (args.image_size or 32)
     coarse_hw = max(4, full_size // (2 ** max(1, int(args.j))))
 
-    # Resolve checkpoints
     coarse_model_path = args.coarse_model_path or os.environ.get("OPENAI_LOGDIR_COARSE")
     cond_model_path = args.cond_model_path or os.environ.get("OPENAI_LOGDIR_COND")
     if coarse_model_path and os.path.isdir(coarse_model_path):
@@ -68,22 +66,19 @@ def main():
         root = os.path.join("results", f"curvelet_J{args.j}")
         cond_model_path = _latest_ckpt(os.path.join(root, "cond"))
     if not coarse_model_path or not cond_model_path:
-        raise FileNotFoundError(
-            "Could not resolve coarse/conditional checkpoints. "
-            "Pass --coarse_model_path/--cond_model_path or set OPENAI_LOGDIR_COARSE/OPENAI_LOGDIR_COND."
-        )
+        raise FileNotFoundError("Could not resolve coarse/conditional checkpoints.")
 
     outdir = args.output_dir or os.path.join("results", f"curvelet_J{args.j}", "samples")
     os.makedirs(outdir, exist_ok=True)
 
-    # Choose a sane number of sampling steps if CLI left default (-1)
     steps_for_sampling = _steps_or_default(getattr(args, "diffusion_steps", -1), default_val=256)
 
-    # Build & load coarse (unconditional) model
+    # coarse model
     params_coarse = script_util.model_and_diffusion_defaults(task="curvelet")
     params_coarse.update(dict(
         j=args.j, conditional=False, angles_per_scale=angles,
         large_size=full_size, small_size=full_size, diffusion_steps=steps_for_sampling,
+        color_channels=C,
     ))
     coarse_model, coarse_diff = script_util.create_model_and_diffusion(
         task="curvelet",
@@ -92,11 +87,12 @@ def main():
     coarse_model.load_state_dict(torch.load(coarse_model_path, map_location="cpu"))
     coarse_model.to(device).eval()
 
-    # Build & load conditional (wedges) model
+    # conditional model
     params_cond = script_util.model_and_diffusion_defaults(task="curvelet")
     params_cond.update(dict(
         j=args.j, conditional=True, angles_per_scale=angles,
         large_size=full_size, small_size=full_size, diffusion_steps=steps_for_sampling,
+        color_channels=C,
     ))
     cond_model, cond_diff = script_util.create_model_and_diffusion(
         task="curvelet",
@@ -105,7 +101,7 @@ def main():
     cond_model.load_state_dict(torch.load(cond_model_path, map_location="cpu"))
     cond_model.to(device).eval()
 
-    # Load stats (for wedges unwhitening)
+    # stats for wedges (coarse left unwhitened here for consistency with training)
     stats_npz = os.path.join("results", f"curvelet_J{args.j}", f"curvelet_stats_j{args.j}.npz")
     if os.path.isfile(stats_npz):
         npz = np.load(stats_npz)
@@ -115,26 +111,26 @@ def main():
         mean, std = curvelet_datasets.curvelet_stats(
             j=args.j, dir_name=args.data_dir, angles_per_scale=angles,
             image_size=full_size, limit=min(256, len(curvelet_datasets._list_images(args.data_dir))),
-            device="cpu",
+            device="cpu", color_channels=C,
         )
         mean, std = mean.to(device), std.to(device)
 
-    mean_w = mean[3:3 + 3 * W_j].view(1, 3 * W_j, 1, 1)
-    std_w = std[3:3 + 3 * W_j].clamp_min(1e-6).view(1, 3 * W_j, 1, 1)
+    mean_w = mean[C:C + C * W_j].view(1, C * W_j, 1, 1)
+    std_w = std[C:C + C * W_j].clamp_min(1e-6).view(1, C * W_j, 1, 1)
 
     num = int(args.num_samples)
     done = 0
     while done < num:
         bs = min(args.batch_size, num - done)
 
-        # 1) coarse sample
-        coarse_shape = (bs, 3, coarse_hw, coarse_hw)
+        # 1) coarse (unconditional)
+        coarse_shape = (bs, C, coarse_hw, coarse_hw)
         with torch.no_grad():
             coarse = coarse_diff.p_sample_loop(coarse_model, coarse_shape, device=device)
             coarse = coarse.clamp(-1, 1)
 
-        # 2) wedge pack given coarse
-        wedge_shape = (bs, 3 * W_j, coarse_hw, coarse_hw)
+        # 2) wedges conditional on coarse
+        wedge_shape = (bs, C * W_j, coarse_hw, coarse_hw)
         with torch.no_grad():
             wedges_white = cond_diff.p_sample_loop(
                 cond_model, wedge_shape, model_kwargs={"conditional": coarse}, device=device
@@ -142,15 +138,21 @@ def main():
         wedges = wedges_white * std_w + mean_w
 
         # 3) inverse curvelet
-        wedges_list = curvelet_ops.unpack_highfreq(wedges, j=args.j, meta={"angles_per_scale": angles or []})
+        wedges_list = curvelet_ops.unpack_highfreq(
+            wedges, j=args.j, meta={"angles_per_scale": angles or [], "color_channels": C}
+        )
         coeffs = {"coarse": coarse, "bands": [wedges_list]}
         final = curvelet_ops.ifdct2(coeffs, output_size=full_size).clamp(-1, 1)
 
         # 4) save
         arr = final.detach().cpu().numpy()
         for i in range(arr.shape[0]):
-            img = ((arr[i].transpose(1, 2, 0) + 1.0) * 127.5).astype(np.uint8)
-            Image.fromarray(img).save(os.path.join(outdir, f"sample_{done + i:06d}.png"))
+            if C == 1:
+                im = ((arr[i, 0] + 1.0) * 127.5).astype(np.uint8)
+                Image.fromarray(im, mode="L").save(os.path.join(outdir, f"sample_{done + i:06d}.png"))
+            else:
+                im = ((arr[i].transpose(1, 2, 0) + 1.0) * 127.5).astype(np.uint8)
+                Image.fromarray(im).save(os.path.join(outdir, f"sample_{done + i:06d}.png"))
         done += bs
 
     print(f"Saved {num} images to {outdir}")
@@ -158,4 +160,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
