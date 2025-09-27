@@ -64,7 +64,7 @@ def main():
             conditional=args.conditional,
             angles_per_scale=args.angles_per_scale,
             image_size=args.large_size,
-            color_channels=args.color_channels,  # NEW
+            color_channels=args.color_channels,  # grayscale or RGB
         )
     else:
         raise ValueError("unsupported task")
@@ -100,7 +100,7 @@ def create_argparser():
         lr_anneal_steps=0,
         max_training_steps=500000,
         batch_size=1,
-        microbatch=-1,
+        microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",
         log_interval=10,
         save_interval=10000,
