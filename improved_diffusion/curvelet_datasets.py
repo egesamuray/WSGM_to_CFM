@@ -14,13 +14,14 @@ import torchvision.transforms as T
 from .curvelet_ops import fdct2, pack_highfreq
 
 
-_IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+# Accept standard images and arrays
+_FILE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".npy", ".npz")
 
 
 def _list_images(root: str) -> List[str]:
     root = os.path.expanduser(root)
     paths: List[str] = []
-    for ext in _IMG_EXTS:
+    for ext in _FILE_EXTS:
         paths.extend(glob.glob(os.path.join(root, f"*{ext}")))
     paths.sort()
     if not paths:
@@ -29,13 +30,16 @@ def _list_images(root: str) -> List[str]:
 
 
 def _make_transform(image_size: Optional[int], color_channels: int) -> T.Compose:
+    """
+    PIL pipeline for standard image files (not used for npy/npz).
+    """
     tfms: List[torch.nn.Module] = []
     if image_size is not None:
         tfms.append(T.Resize((image_size, image_size), interpolation=T.InterpolationMode.BICUBIC))
-    tfms.append(T.ToTensor())  # -> [0,1], C either 1 (L) or 3 (RGB)
+    tfms.append(T.ToTensor())  # -> [0,1]
     mean = [0.5] * color_channels
     std = [0.5] * color_channels
-    tfms.append(T.Normalize(mean=mean, std=std))  # -> [-1,1]
+    tfms.append(T.Normalize(mean=mean, std=std))  # [-1,1]
     return T.Compose(tfms)
 
 
@@ -56,6 +60,97 @@ def _wedges_at_scale(j: int, angles_per_scale: Optional[List[int]]) -> int:
     idx = -min(j, len(angles_per_scale))
     return int(angles_per_scale[idx])
 
+
+# ----------------------------- I/O helpers -----------------------------------
+
+def _npy_to_tensor(path: str, color_channels: int) -> torch.Tensor:
+    """
+    Load .npy or .npz -> (C,H,W) float32 in [-1,1].
+    - For .npz, uses the first key encountered.
+    - If array is (H,W), makes C=1; if C=3 requested, replicates channels.
+    - If array is (H,W,1|3) or (1|3,H,W) it is reshaped accordingly.
+    - Per-image min-max normalization to [0,1] then scaled to [-1,1].
+    """
+    if path.lower().endswith(".npz"):
+        z = np.load(path)
+        if len(z.files) == 0:
+            raise ValueError(f"{path} has no arrays.")
+        arr = z[z.files[0]]
+    else:
+        arr = np.load(path)
+
+    arr = np.asarray(arr)
+
+    # Handle shapes
+    if arr.ndim == 2:
+        # (H,W)
+        H, W = arr.shape
+        C = 1
+        arr = arr.reshape(H, W, 1)
+    elif arr.ndim == 3:
+        # (H,W,C) or (C,H,W)
+        if arr.shape[0] in (1, 3) and arr.shape[1] != arr.shape[0]:
+            # Assume (C,H,W) -> (H,W,C)
+            arr = np.transpose(arr, (1, 2, 0))
+        H, W, C = arr.shape
+        if C not in (1, 3):
+            # Try to squeeze or pick first channel
+            if C > 3:
+                arr = arr[..., :3]
+                C = 3
+            else:
+                arr = arr[..., :1]
+                C = 1
+    else:
+        raise ValueError(f"Unsupported array shape {arr.shape} for {path}")
+
+    # Per-image robust min-max
+    arr = arr.astype(np.float32)
+    vmin = np.min(arr)
+    vmax = np.max(arr)
+    if vmax > vmin:
+        arr = (arr - vmin) / (vmax - vmin)
+    else:
+        arr = np.zeros_like(arr, dtype=np.float32)
+
+    # If requested color_channels != array channels, adapt
+    if color_channels == 1:
+        if C == 3:
+            # Convert RGB-like to L via average
+            arr = np.mean(arr, axis=-1, keepdims=True)
+        # else already 1
+    else:  # color_channels == 3
+        if C == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+
+    # (H,W,C) [0,1] -> tensor (C,H,W) [-1,1]
+    arr = 2.0 * arr - 1.0
+    t = torch.from_numpy(np.transpose(arr, (2, 0, 1)))  # (C,H,W)
+    return t
+
+
+def _load_tensor_from_path(path: str, color_channels: int, image_size: Optional[int]) -> torch.Tensor:
+    """
+    Return a tensor (C,H,W) in [-1,1], CPU. Works for both images and npy/npz.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".npy", ".npz"):
+        x = _npy_to_tensor(path, color_channels)  # (C,H,W)
+        if image_size is not None and (x.shape[-2] != image_size or x.shape[-1] != image_size):
+            x4 = x.unsqueeze(0)  # (1,C,H,W)
+            x4 = F.interpolate(x4, size=(image_size, image_size), mode="bilinear", align_corners=False)
+            x = x4.squeeze(0)
+        return x
+
+    # PIL route for standard images
+    img = Image.open(path)
+    img = img.convert("L") if color_channels == 1 else img.convert("RGB")
+    tfm = _make_transform(image_size, color_channels)
+    x = tfm(img)  # (C,H,W) in [-1,1]
+    return x
+
+
+# ------------------------------- Stats API -----------------------------------
 
 @torch.no_grad()
 def curvelet_stats(
@@ -78,9 +173,7 @@ def curvelet_stats(
     angles = _angles_parse(angles_per_scale)
     J = len(angles) if angles else max(j, 3)
     W_j = _wedges_at_scale(j, angles)
-
-    dev = device or "cpu"
-    tfm = _make_transform(image_size, color_channels)
+    _ = device  # kept for signature compatibility
 
     sum_c = None
     sumsq_c = None
@@ -99,12 +192,7 @@ def curvelet_stats(
     print(f"Computing stats for scale {j} (W_j={W_j}) on {len(paths)} images...")
 
     for p in paths:
-        img = Image.open(p)
-        if color_channels == 1:
-            img = img.convert("L")  # grayscale
-        else:
-            img = img.convert("RGB")
-        x = tfm(img).unsqueeze(0)  # (1,C,H,W), CPU
+        x = _load_tensor_from_path(p, color_channels, image_size).unsqueeze(0)  # (1,C,H,W)
 
         coeffs = fdct2(x, J=J, angles_per_scale=angles)
         coarse = coeffs["coarse"]                    # (1,C,Hc,Wc)
@@ -122,15 +210,16 @@ def curvelet_stats(
     mean = sum_c / count
     var = sumsq_c / count - mean ** 2
     std = torch.sqrt(var.clamp_min(1e-12))
-
     return mean.cpu(), std.cpu()
 
+
+# ------------------------------ Dataset / Loader -----------------------------
 
 class CurveletDataset(Dataset):
     """
     If conditional=True: X = packed wedges (whitened), KW = {'conditional': coarse}
     else               : X = coarse, KW = {}
-    CPU-only; training loop moves tensors to device.
+    All CPU; training loop moves tensors to device.
     """
     def __init__(
         self,
@@ -149,7 +238,6 @@ class CurveletDataset(Dataset):
         self.conditional = bool(conditional)
         self.angles = _angles_parse(angles_per_scale)
         self.C = int(color_channels)
-        self.tfm = _make_transform(self.image_size, self.C)
 
         if stats is None and self.conditional:
             with torch.no_grad():
@@ -174,12 +262,7 @@ class CurveletDataset(Dataset):
 
     def __getitem__(self, idx: int):
         p = self.paths[idx]
-        img = Image.open(p)
-        if self.C == 1:
-            img = img.convert("L")
-        else:
-            img = img.convert("RGB")
-        x = self.tfm(img).unsqueeze(0)  # (1,C,H,W)
+        x = _load_tensor_from_path(p, self.C, self.image_size).unsqueeze(0)  # (1,C,H,W)
 
         coeffs = fdct2(x, J=(len(self.angles) if self.angles else max(self.j, 3)), angles_per_scale=self.angles)
         coarse = coeffs["coarse"]          # (1,C,Hc,Wc)
