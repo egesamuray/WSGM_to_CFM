@@ -254,9 +254,10 @@ def create_gaussian_diffusion(
         loss_type = gd.LossType.RESCALED_MSE
     else:
         loss_type = gd.LossType.MSE
+    # >>> KEY FIX: The GaussianDiffusion expects 'num_timesteps', not 'num_diffusion_steps'
     return gd.GaussianDiffusion(
         schedule=ScheduleSampler(final_time=final_time, schedule=noise_schedule),
-        num_diffusion_steps=steps,
+        num_timesteps=steps,
         model_mean_type=(gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X),
         model_var_type=(
             (gd.ModelVarType.FIXED_LARGE if not sigma_small else gd.ModelVarType.FIXED_SMALL)
