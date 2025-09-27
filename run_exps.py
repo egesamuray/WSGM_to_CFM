@@ -33,33 +33,28 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--task", choices=["standard", "super_res", "wavelet", "curvelet"], required=True)
     p.add_argument("--data_dir", type=str, required=True)
-    p.add_argument("--j", type=int, default=1, help="Scale index (1=finest).")
-    p.add_argument("--angles_per_scale", type=str, default=None, help="coarsest->finest, e.g. '8' or '8,16,32'")
-    p.add_argument("--final_size", type=int, default=64, help="full image size (H=W)")
+    p.add_argument("--j", type=int, default=1)
+    p.add_argument("--angles_per_scale", type=str, default=None)
+    p.add_argument("--final_size", type=int, default=64)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_samples", type=int, default=16)
-    p.add_argument("--color_channels", type=int, default=3)  # 1 = grayscale, 3 = RGB
+    p.add_argument("--color_channels", type=int, default=3)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    assert args.task == "curvelet", "This runner currently wires the curvelet task only."
+    assert args.task == "curvelet"
 
     results_dir = os.path.join("results", f"curvelet_J{args.j}")
     os.makedirs(results_dir, exist_ok=True)
     print(f"Results will be saved to {results_dir}")
 
-    # 0) stats (CPU)
     print(f"Computing stats for scale {args.j}...")
     mean, std = curvelet_datasets.curvelet_stats(
-        j=args.j,
-        dir_name=args.data_dir,
-        angles_per_scale=args.angles_per_scale,
-        image_size=args.final_size,
-        limit=None,
-        device="cpu",
+        j=args.j, dir_name=args.data_dir, angles_per_scale=args.angles_per_scale,
+        image_size=args.final_size, limit=None, device="cpu",
         color_channels=args.color_channels,
     )
     np.savez(os.path.join(results_dir, f"curvelet_stats_j{args.j}.npz"),
@@ -68,7 +63,7 @@ def main():
     env = _env_with_repo_on_path()
     repo_root = os.path.abspath(os.path.dirname(__file__))
 
-    # 1) train coarse
+    # Train coarse
     coarse_logdir = os.path.join(results_dir, "coarse")
     os.makedirs(coarse_logdir, exist_ok=True)
     env_coarse = dict(env, OPENAI_LOGDIR=coarse_logdir)
@@ -91,7 +86,7 @@ def main():
     if not coarse_ckpt:
         raise FileNotFoundError(f"No checkpoints found under {coarse_logdir}")
 
-    # 2) train conditional
+    # Train conditional
     cond_logdir = os.path.join(results_dir, "cond")
     os.makedirs(cond_logdir, exist_ok=True)
     env_cond = dict(env, OPENAI_LOGDIR=cond_logdir)
@@ -114,7 +109,7 @@ def main():
     if not cond_ckpt:
         raise FileNotFoundError(f"No checkpoints found under {cond_logdir}")
 
-    # 3) sample final images
+    # Sample
     print("Sampling...")
     samples_dir = os.path.join(results_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
@@ -139,3 +134,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
