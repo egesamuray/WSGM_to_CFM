@@ -15,7 +15,6 @@ from improved_diffusion.script_util import (
     add_dict_to_argparser,
 )
 from improved_diffusion.train_util import TrainLoop
-
 from improved_diffusion.curvelet_datasets import load_data_curvelet
 
 
@@ -30,32 +29,17 @@ def main():
 
     logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
-        task=args.task, **args_to_dict(args, model_and_diffusion_defaults(task=args.task).keys()),
+        task=args.task, **args_to_dict(args, model_and_diffusion_defaults(task=args.task).keys())
     )
     model.to(dist_util.dev())
 
     logger.log("creating data loader...")
     if args.task == "standard":
-        data = load_data(
-            data_dir=args.data_dir,
-            batch_size=args.batch_size,
-            image_size=args.large_size,
-            class_cond=args.class_cond,
-        )
+        data = load_data(args.data_dir, args.batch_size, args.large_size, args.class_cond)
     elif args.task == "super_res":
-        data = load_data(
-            data_dir=args.data_dir,
-            batch_size=args.batch_size,
-            image_size=args.large_size,
-            class_cond=args.class_cond,
-        )
+        data = load_data(args.data_dir, args.batch_size, args.large_size, args.class_cond)
     elif args.task == "wavelet":
-        data = load_data_wavelet(
-            data_dir=args.data_dir,
-            batch_size=args.batch_size,
-            j=args.j,
-            conditional=args.conditional,
-        )
+        data = load_data_wavelet(args.data_dir, args.batch_size, args.j, args.conditional)
     elif args.task == "curvelet":
         data = load_data_curvelet(
             data_dir=args.data_dir,
@@ -64,7 +48,7 @@ def main():
             conditional=args.conditional,
             angles_per_scale=args.angles_per_scale,
             image_size=args.large_size,
-            color_channels=args.color_channels,  # grayscale or RGB
+            color_channels=args.color_channels,
         )
     else:
         raise ValueError("unsupported task")
@@ -100,7 +84,7 @@ def create_argparser():
         lr_anneal_steps=0,
         max_training_steps=500000,
         batch_size=1,
-        microbatch=-1,  # -1 disables microbatches
+        microbatch=-1,
         ema_rate="0.9999",
         log_interval=10,
         save_interval=10000,
