@@ -24,140 +24,106 @@ except ImportError:
 
 def fdct2(x, J=None, angles_per_scale=None):
     """
-    Forward 2D Curvelet transform (wrapping) for batch of images.
+    Forward 2D Curvelet transform for a batch of images.
     Args:
-      x: Tensor (B,3,H,W) in [-1,1] (assumed normalized image).
+      x: Tensor (B,3,H,W) in [-1,1].
       J: number of scales (excluding the final lowpass). If None, choose based on image size.
-      angles_per_scale: list of length J with number of wedges per scale (coarsest->finest).
-    Returns: dict with keys:
-      'coarse': Tensor (B,3,N_J,N_J) low-frequency image,
-      'bands': list of length J, where bands[i] is list of wedge Tensors at scale (J-i),
-      'meta': dict with transform metadata (angles_per_scale, input_shape, etc).
+      angles_per_scale: list of length J with number of wedges per scale (coarsest -> finest).
+    Returns:
+      Dict with 'coarse': Tensor (B,3,N_J,N_J) low-frequency image,
+                   'bands': list of length J of lists of wedge tensors,
+                   'meta': transform metadata.
     """
     B, C, H, W = x.shape
     assert C == 3, "Input must have 3 color channels"
-    # Determine J and angles
+    # Determine J and default angles per scale if not provided
     if J is None:
-        # Choose J such that coarse size is at most ~8 or 4
-        # Here we ensure H/(2^J) >= 4
-        J = int(math.log2(H) - 2)
-        J = max(J, 1)
+        # Choose J such that final coarse image is >= 4x4
+        J = max(int(math.log2(H) - 2), 1)
     if angles_per_scale is None:
-        # Default angles: increase up to 32, remain constant afterwards
         angles_per_scale = []
         ang = 8
         for j in range(1, J+1):
             angles_per_scale.append(min(ang, 32))
             if ang < 32:
                 ang *= 2
-        # Note: angles_per_scale[0] for coarsest oriented band
-        # e.g., J=4 -> [8,16,32,32]
-    # If external lib available, attempt to use it (currently not integrated due to format differences)
-    if _has_curvelops or _has_pycurvelab or _has_curvelets_lib:
-        # Placeholder: use fallback implementation for now
-        pass
-
-    # Internal recursive transform
-    def _fdct2_recursive(img):
-        """
-        Recursive helper: returns (coarse_image, bands_list) for given image tensor.
-        bands_list: list of wedge lists from coarsest (current image's high freq) to finest.
-        """
-        # Determine current image size and radial cutoff
+        # e.g., J=4 -> angles_per_scale = [8, 16, 32, 32]
+    # (External curvelet library usage is omitted – using internal implementation)
+    angles_rev = list(reversed(angles_per_scale))  # use fine-to-coarse order
+    def _fdct2_recursive(img, angle_idx=0):
+        # Get current image size
         _, _, Hc, Wc = img.shape
-        if Hc < 2 or Wc < 2 or len(curr_angles) == 0:
-            # No further decomposition
+        # Base case: stop if no more scales or image too small
+        if angle_idx >= len(angles_rev) or Hc < 2 or Wc < 2:
             return img, []
-        # Compute one-level curvelet transform on this img
-        # Setup masks for coarse and current finest band
-        # Frequency coords
+        # Compute FFT of current image
         device = img.device
-        # Compute FFT (channels independent)
-        F_img = torch.fft.fft2(img, dim=(-2, -1))
-        # Shift zero-frequency to center
-        F_img = torch.fft.fftshift(F_img, dim=(-2, -1))
+        F_img = torch.fft.fftshift(torch.fft.fft2(img, dim=(-2, -1)), dim=(-2, -1))
         # Frequency grid
         if Hc % 2 == 0:
-            freq_y = torch.arange(-Hc//2, Hc//2, device=device)
+            fy = torch.arange(-Hc//2, Hc//2, device=device)
         else:
-            freq_y = torch.arange(-(Hc//2), Hc//2+1, device=device)
+            fy = torch.arange(-(Hc//2), Hc//2 + 1, device=device)
         if Wc % 2 == 0:
-            freq_x = torch.arange(-Wc//2, Wc//2, device=device)
+            fx = torch.arange(-Wc//2, Wc//2, device=device)
         else:
-            freq_x = torch.arange(-(Wc//2), Wc//2+1, device=device)
-        Vy, Ux = torch.meshgrid(freq_y, freq_x, indexing='ij')
+            fx = torch.arange(-(Wc//2), Wc//2 + 1, device=device)
+        Vy, Ux = torch.meshgrid(fy, fx, indexing='ij')
         R = torch.sqrt(Ux**2 + Vy**2)
-        # Radial cutoff: half of current Nyquist (to allow downsampling by 2)
-        r_cut = min(Hc, Wc) / 4.0  # half of Nyquist (which is ~ min/2)
-        r_cut = math.floor(r_cut)
+        # Radial cutoff at half the Nyquist frequency (allow downsampling by 2)
+        r_cut = math.floor(min(Hc, Wc) / 4.0)
         if r_cut < 1:
-            # stop if too small to split
             return img, []
-        # Construct coarse mask and highpass mask
-        # Coarse: R <= r_cut (inclusive)
+        # Separate low frequencies (coarse) and high frequencies
         coarse_mask = (R <= r_cut)
-        # Highpass: R > r_cut
-        high_mask = (R > r_cut)
-        # Allocate coarse and high frequency arrays
-        F_coarse = F_img * coarse_mask  # shape (B,3,Hc,Wc)
-        F_high = F_img * high_mask
-        # Inverse FFT to spatial
+        high_mask   = (R > r_cut)
+        F_coarse = F_img * coarse_mask
+        F_high   = F_img * high_mask
+        # Inverse FFT to spatial domain for coarse part, then downsample by 2
         coarse_full = torch.fft.ifft2(torch.fft.ifftshift(F_coarse, dim=(-2, -1)), dim=(-2, -1)).real
-        # Downsample coarse by 2 in spatial domain
-        coarse_small = coarse_full[..., ::2, ::2]  # (B,3,Hc/2,Wc/2)
-        # Split high frequencies by angle into wedges
-        W_cur = curr_angles[0]
+        coarse_small = coarse_full[..., ::2, ::2]  # downsampled coarse image
+        # Angular wedge decomposition of high frequencies
+        W_cur = angles_rev[angle_idx]             # number of wedges at this scale
+        theta = torch.atan2(Vy, Ux).abs()         # angle (0 to pi) for each frequency
         wedge_list = []
-        # Angular sectors [0, pi)
         for k in range(W_cur):
             theta_min = k * math.pi / W_cur
             theta_max = (k + 1) * math.pi / W_cur
-            # Mask for this wedge (including symmetric negative freq)
-            theta = torch.atan2(Vy, Ux).abs()  # 0 to pi
             if k < W_cur - 1:
-                wedge_mask = high_mask & (theta >= theta_min) & (theta < theta_max)
+                mask = high_mask & (theta >= theta_min) & (theta < theta_max)
             else:
-                # last wedge includes upper bound
-                wedge_mask = high_mask & (theta >= theta_min) & (theta <= theta_max)
-            if not wedge_mask.any():
-                # If image too small or wedge empty, skip
+                # Include upper bound for last wedge
+                mask = high_mask & (theta >= theta_min) & (theta <= theta_max)
+            if not mask.any():
                 wedge_image = torch.zeros_like(img)
             else:
-                F_wedge = F_img * wedge_mask
+                F_wedge = F_img * mask
                 wedge_image = torch.fft.ifft2(torch.fft.ifftshift(F_wedge, dim=(-2, -1)), dim=(-2, -1)).real
-            wedge_list.append(wedge_image)  # shape (B,3,Hc,Wc) each
-        # Recursively transform coarse_small
-        next_angles = curr_angles[1:]
-        coarse_rec, bands_rec = _fdct2_recursive(coarse_small.unsqueeze(0) if coarse_small.ndim == 3 else coarse_small)
-        # Combine bands: append current wedge list at end
-        bands_all = bands_rec + [wedge_list]
-        return coarse_rec, bands_all
-
-    # We call the recursive transform for each image in batch individually (to conserve memory)
+            wedge_list.append(wedge_image)  # shape (B,3,Hc,Wc)
+        # Recurse on the downsampled coarse image for further scales
+        coarse_rec, bands_rec = _fdct2_recursive(coarse_small, angle_idx + 1)
+        return coarse_rec, bands_rec + [wedge_list]
+    # Process each image in the batch (to conserve memory)
     batch_coarse = []
     batch_bands = None
-    # Prepare angle list reversed for fine-first
-    angles_rev = list(reversed(angles_per_scale))
-    curr_angles = angles_rev  # global for recursion
     for b in range(B):
-        img_b = x[b:b+1]  # shape (1,3,H,W)
-        coarse_b, bands_b = _fdct2_recursive(img_b)
-        # coarse_b shape (1,3,H_final,W_final), bands_b list of lists
+        coarse_b, bands_b = _fdct2_recursive(x[b:b+1], angle_idx=0)
         batch_coarse.append(coarse_b)
         if batch_bands is None:
-            # initialize batch_bands structure
-            batch_bands = [ [wedge for wedge in band] for band in bands_b ]
-            # Now batch_bands is a list (len=J) of lists (len=W_j) of wedge tensors of shape (1,3, ...).
+            # Initialize bands structure with the first image's bands
+            batch_bands = [[wedge for wedge in band] for band in bands_b]
         else:
-            # append this image's wedge to existing batch tensors
+            # Concatenate subsequent images' wedges along batch dimension
             for si, band in enumerate(bands_b):
                 for wi, wedge in enumerate(band):
                     batch_bands[si][wi] = torch.cat([batch_bands[si][wi], wedge], dim=0)
-    # Stack coarse images
-    coarse_batch = torch.cat(batch_coarse, dim=0)  # (B,3,N_J,N_J)
-    coeffs = {'coarse': coarse_batch, 'bands': batch_bands,
-              'meta': {'angles_per_scale': angles_per_scale, 'input_shape': (B,C,H,W)}}
-    return coeffs
+    coarse_batch = torch.cat(batch_coarse, dim=0)  # (B,3,N_J,N_J) low-frequency images
+    return {
+        'coarse': coarse_batch,
+        'bands': batch_bands,
+        'meta': {'angles_per_scale': angles_per_scale, 'input_shape': (B, C, H, W)}
+    }
+
 
 def ifdct2(coeffs, output_size=None):
     """
