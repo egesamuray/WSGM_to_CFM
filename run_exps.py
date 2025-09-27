@@ -39,7 +39,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_samples", type=int, default=16)
-    p.add_argument("--color_channels", type=int, default=3)  # NEW
+    p.add_argument("--color_channels", type=int, default=3)  # 1 = grayscale, 3 = RGB
     return p.parse_args()
 
 
