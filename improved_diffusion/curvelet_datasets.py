@@ -61,8 +61,6 @@ def _wedges_at_scale(j: int, angles_per_scale: Optional[List[int]]) -> int:
     return int(angles_per_scale[idx])
 
 
-# ----------------------------- I/O helpers -----------------------------------
-
 def _npy_to_tensor(path: str, color_channels: int) -> torch.Tensor:
     """
     Load .npy or .npz -> (C,H,W) float32 in [-1,1].
@@ -83,18 +81,15 @@ def _npy_to_tensor(path: str, color_channels: int) -> torch.Tensor:
 
     # Handle shapes
     if arr.ndim == 2:
-        # (H,W)
         H, W = arr.shape
         C = 1
         arr = arr.reshape(H, W, 1)
     elif arr.ndim == 3:
         # (H,W,C) or (C,H,W)
         if arr.shape[0] in (1, 3) and arr.shape[1] != arr.shape[0]:
-            # Assume (C,H,W) -> (H,W,C)
             arr = np.transpose(arr, (1, 2, 0))
         H, W, C = arr.shape
         if C not in (1, 3):
-            # Try to squeeze or pick first channel
             if C > 3:
                 arr = arr[..., :3]
                 C = 3
@@ -113,13 +108,11 @@ def _npy_to_tensor(path: str, color_channels: int) -> torch.Tensor:
     else:
         arr = np.zeros_like(arr, dtype=np.float32)
 
-    # If requested color_channels != array channels, adapt
+    # Adapt to requested color channels
     if color_channels == 1:
         if C == 3:
-            # Convert RGB-like to L via average
             arr = np.mean(arr, axis=-1, keepdims=True)
-        # else already 1
-    else:  # color_channels == 3
+    else:
         if C == 1:
             arr = np.repeat(arr, 3, axis=-1)
 
@@ -138,7 +131,7 @@ def _load_tensor_from_path(path: str, color_channels: int, image_size: Optional[
         x = _npy_to_tensor(path, color_channels)  # (C,H,W)
         if image_size is not None and (x.shape[-2] != image_size or x.shape[-1] != image_size):
             x4 = x.unsqueeze(0)  # (1,C,H,W)
-            x4 = F.interpolate(x4, size=(image_size, image_size), mode="bilinear", align_corners=False)
+            x4 = torch.nn.functional.interpolate(x4, size=(image_size, image_size), mode="bilinear", align_corners=False)
             x = x4.squeeze(0)
         return x
 
@@ -149,8 +142,6 @@ def _load_tensor_from_path(path: str, color_channels: int, image_size: Optional[
     x = tfm(img)  # (C,H,W) in [-1,1]
     return x
 
-
-# ------------------------------- Stats API -----------------------------------
 
 @torch.no_grad()
 def curvelet_stats(
@@ -173,7 +164,7 @@ def curvelet_stats(
     angles = _angles_parse(angles_per_scale)
     J = len(angles) if angles else max(j, 3)
     W_j = _wedges_at_scale(j, angles)
-    _ = device  # kept for signature compatibility
+    _ = device  # signature compatibility
 
     sum_c = None
     sumsq_c = None
@@ -199,7 +190,7 @@ def curvelet_stats(
         packed = pack_highfreq(coeffs, j)            # (1,C*W_j,Nj,Nj)
 
         if coarse.shape[-2:] != packed.shape[-2:]:
-            coarse = F.interpolate(coarse, size=packed.shape[-2:], mode="bilinear", align_corners=False)
+            coarse = torch.nn.functional.interpolate(coarse, size=packed.shape[-2:], mode="bilinear", align_corners=False)
 
         combo = torch.cat([coarse, packed], dim=1)   # (1, C + C*W_j, Nj, Nj)
         Ctot = combo.size(1)
@@ -212,8 +203,6 @@ def curvelet_stats(
     std = torch.sqrt(var.clamp_min(1e-12))
     return mean.cpu(), std.cpu()
 
-
-# ------------------------------ Dataset / Loader -----------------------------
 
 class CurveletDataset(Dataset):
     """
@@ -269,7 +258,7 @@ class CurveletDataset(Dataset):
         packed = pack_highfreq(coeffs, self.j)  # (1,C*Wj,Nj,Nj)
 
         if coarse.shape[-2:] != packed.shape[-2:]:
-            coarse = F.interpolate(coarse, size=packed.shape[-2:], mode="bilinear", align_corners=False)
+            coarse = torch.nn.functional.interpolate(coarse, size=packed.shape[-2:], mode="bilinear", align_corners=False)
 
         if self.conditional:
             X = packed[0]  # (C*Wj,Nj,Nj)
@@ -299,6 +288,17 @@ def load_data_curvelet(
     num_workers: int = 0,
     color_channels: int = 3,
 ):
+    """
+    Loader with sensible performance defaults:
+    - pin_memory = True if CUDA is available
+    - num_workers can be overridden by env CURVELET_LOADER_WORKERS (if > num_workers)
+    """
+    try:
+        env_nw = int(os.getenv("CURVELET_LOADER_WORKERS", "0"))
+    except Exception:
+        env_nw = 0
+    nw = num_workers if num_workers > 0 else max(0, env_nw)
+
     ds = CurveletDataset(
         image_dir=data_dir,
         image_size=image_size,
@@ -312,9 +312,10 @@ def load_data_curvelet(
         ds,
         batch_size=batch_size,
         shuffle=not deterministic,
-        num_workers=num_workers,
-        pin_memory=False,
+        num_workers=nw,
+        pin_memory=torch.cuda.is_available(),
         drop_last=True,
+        persistent_workers=(nw > 0),
     )
 
     def _gen():
