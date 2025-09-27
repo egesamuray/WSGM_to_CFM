@@ -4,7 +4,6 @@ import glob
 import argparse
 import numpy as np
 from PIL import Image
-
 import torch
 
 from improved_diffusion import script_util
@@ -12,7 +11,6 @@ from improved_diffusion import curvelet_datasets, curvelet_ops
 
 
 def _latest_ckpt(d):
-    """Pick the newest .pt in directory d (prefers EMA if names are comparable)."""
     if not d or not os.path.isdir(d):
         return None
     cands = [p for p in glob.glob(os.path.join(d, "*.pt")) if os.path.isfile(p)]
@@ -32,43 +30,43 @@ def _angles_list(s):
     return [int(x.strip()) for x in str(s).split(",") if x.strip()]
 
 
+def _steps_or_default(x, default_val=256):
+    try:
+        xv = int(x)
+        return xv if xv > 0 else default_val
+    except Exception:
+        return default_val
+
+
 def main():
-    # Base parser from script_util (adds task-aware defaults & common flags, including --output_dir)
+    # Pull base args (includes --output_dir already)
     parser = script_util.create_argparser()
-    # Only add params that do NOT exist in script_util to avoid conflicts:
+    # Only add params not present in script_util to avoid argparse conflicts
     parser.add_argument("--coarse_model_path", type=str, default=None)
     parser.add_argument("--cond_model_path", type=str, default=None)
     args = parser.parse_args()
 
-    # This script is wired for curvelet
     assert args.task == "curvelet", "Use --task curvelet for this sampler."
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     angles = _angles_list(args.angles_per_scale)
     W_j = max(1, script_util._wedges_at_scale(args.j if args.j else 1, angles))
-
-    # Full output size; coarse size at scale j is 2^{-j} of full (rounded)
     full_size = args.large_size if args.large_size else (args.image_size or 32)
     coarse_hw = max(4, full_size // (2 ** max(1, int(args.j))))
 
-    # Resolve checkpoint paths
+    # Resolve checkpoints
     coarse_model_path = args.coarse_model_path or os.environ.get("OPENAI_LOGDIR_COARSE")
     cond_model_path = args.cond_model_path or os.environ.get("OPENAI_LOGDIR_COND")
-
-    # If env vars point to dirs, pick latest file within
     if coarse_model_path and os.path.isdir(coarse_model_path):
         coarse_model_path = _latest_ckpt(coarse_model_path)
     if cond_model_path and os.path.isdir(cond_model_path):
         cond_model_path = _latest_ckpt(cond_model_path)
-
-    # Fallback under results/
     if not coarse_model_path or not os.path.isfile(coarse_model_path):
         root = os.path.join("results", f"curvelet_J{args.j}")
         coarse_model_path = _latest_ckpt(os.path.join(root, "coarse"))
     if not cond_model_path or not os.path.isfile(cond_model_path):
         root = os.path.join("results", f"curvelet_J{args.j}")
         cond_model_path = _latest_ckpt(os.path.join(root, "cond"))
-
     if not coarse_model_path or not cond_model_path:
         raise FileNotFoundError(
             "Could not resolve coarse/conditional checkpoints. "
@@ -78,11 +76,14 @@ def main():
     outdir = args.output_dir or os.path.join("results", f"curvelet_J{args.j}", "samples")
     os.makedirs(outdir, exist_ok=True)
 
+    # Choose a sane number of sampling steps if CLI left default (-1)
+    steps_for_sampling = _steps_or_default(getattr(args, "diffusion_steps", -1), default_val=256)
+
     # Build & load coarse (unconditional) model
     params_coarse = script_util.model_and_diffusion_defaults(task="curvelet")
     params_coarse.update(dict(
         j=args.j, conditional=False, angles_per_scale=angles,
-        large_size=full_size, small_size=full_size,
+        large_size=full_size, small_size=full_size, diffusion_steps=steps_for_sampling,
     ))
     coarse_model, coarse_diff = script_util.create_model_and_diffusion(
         task="curvelet",
@@ -95,7 +96,7 @@ def main():
     params_cond = script_util.model_and_diffusion_defaults(task="curvelet")
     params_cond.update(dict(
         j=args.j, conditional=True, angles_per_scale=angles,
-        large_size=full_size, small_size=full_size,
+        large_size=full_size, small_size=full_size, diffusion_steps=steps_for_sampling,
     ))
     cond_model, cond_diff = script_util.create_model_and_diffusion(
         task="curvelet",
@@ -104,7 +105,7 @@ def main():
     cond_model.load_state_dict(torch.load(cond_model_path, map_location="cpu"))
     cond_model.to(device).eval()
 
-    # Load saved stats to unwhiten wedges (coarse is unwhitened in training & here)
+    # Load stats (for wedges unwhitening)
     stats_npz = os.path.join("results", f"curvelet_J{args.j}", f"curvelet_stats_j{args.j}.npz")
     if os.path.isfile(stats_npz):
         npz = np.load(stats_npz)
@@ -118,7 +119,6 @@ def main():
         )
         mean, std = mean.to(device), std.to(device)
 
-    # Split stats: coarse (first 3) vs wedges (next 3*W_j)
     mean_w = mean[3:3 + 3 * W_j].view(1, 3 * W_j, 1, 1)
     std_w = std[3:3 + 3 * W_j].clamp_min(1e-6).view(1, 3 * W_j, 1, 1)
 
@@ -127,28 +127,26 @@ def main():
     while done < num:
         bs = min(args.batch_size, num - done)
 
-        # 1) Sample coarse (unconditional)
+        # 1) coarse sample
         coarse_shape = (bs, 3, coarse_hw, coarse_hw)
         with torch.no_grad():
             coarse = coarse_diff.p_sample_loop(coarse_model, coarse_shape, device=device)
             coarse = coarse.clamp(-1, 1)
 
-        # 2) Sample wedge pack given coarse (pass same scaling as training: unwhitened coarse)
+        # 2) wedge pack given coarse
         wedge_shape = (bs, 3 * W_j, coarse_hw, coarse_hw)
         with torch.no_grad():
             wedges_white = cond_diff.p_sample_loop(
                 cond_model, wedge_shape, model_kwargs={"conditional": coarse}, device=device
             )
-        wedges = wedges_white * std_w + mean_w  # unwhiten **wedges only**
+        wedges = wedges_white * std_w + mean_w
 
-        # 3) Inverse curvelet (one scale): upsample coarse ×2 and add all wedges
-        wedges_list = curvelet_ops.unpack_highfreq(
-            wedges, j=args.j, meta={"angles_per_scale": angles or []}
-        )
+        # 3) inverse curvelet
+        wedges_list = curvelet_ops.unpack_highfreq(wedges, j=args.j, meta={"angles_per_scale": angles or []})
         coeffs = {"coarse": coarse, "bands": [wedges_list]}
         final = curvelet_ops.ifdct2(coeffs, output_size=full_size).clamp(-1, 1)
 
-        # 4) Save PNGs
+        # 4) save
         arr = final.detach().cpu().numpy()
         for i in range(arr.shape[0]):
             img = ((arr[i].transpose(1, 2, 0) + 1.0) * 127.5).astype(np.uint8)
