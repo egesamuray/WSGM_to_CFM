@@ -1,5 +1,6 @@
 # improved_diffusion/curvelet_ops.py
 import math
+from functools import lru_cache
 from typing import Dict, List, Tuple, Optional
 
 import torch
@@ -97,6 +98,25 @@ def _make_filters(
     return coarse, wedge_filts, meta
 
 
+@lru_cache(maxsize=32)
+def _filters_cpu_cached(h: int, w: int, J: int, angles_tuple: tuple):
+    """Build filters once on CPU/float32 and cache them."""
+    angles = list(angles_tuple) if angles_tuple else None
+    coarse_cpu, wedge_cpu, meta = _make_filters(
+        h, w, J, angles, device=torch.device("cpu"), dtype=torch.float32
+    )
+    wedge_cpu = [[f.cpu().float() for f in row] for row in wedge_cpu]
+    return coarse_cpu.cpu().float(), wedge_cpu, meta
+
+
+def _make_filters_fast(h, w, J, angles_per_scale, device, dtype):
+    angles_tuple = tuple(int(a) for a in (angles_per_scale or []))
+    coarse_cpu, wedge_cpu, meta = _filters_cpu_cached(h, w, J, angles_tuple)
+    coarse = coarse_cpu.to(device=device, dtype=dtype)
+    wedge_filts = [[f.to(device=device, dtype=dtype) for f in row] for row in wedge_cpu]
+    return coarse, wedge_filts, meta
+
+
 @torch.no_grad()
 def fdct2(
     x: torch.Tensor,
@@ -124,7 +144,8 @@ def fdct2(
         J = 3 if max(H, W) <= 128 else 4
 
     X = _fft2c(x)
-    coarse_filt, wedge_filts, meta = _make_filters(H, W, J, angles_per_scale, device, dtype)
+    # cached filters
+    coarse_filt, wedge_filts, meta = _make_filters_fast(H, W, J, angles_per_scale, device, dtype)
 
     Coarse = X * coarse_filt
     coarse = _ifft2c(Coarse)
@@ -150,13 +171,12 @@ def pack_highfreq(coeffs: Dict, j: int) -> torch.Tensor:
     """
     bands_j = coeffs["bands"][j - 1]
     B, C, Hj, Wj = bands_j[0].shape
-    # Downsample wedges to coarse size at this level (factor ~2)
-    Nj = math.ceil(Hj / 2)
+    Nj = math.ceil(Hj / 2)  # coarse size at this level
     packed_list = []
     for w in bands_j:
         w_small = F.interpolate(w, size=(Nj, Nj), mode="area")
         packed_list.append(w_small)
-    return torch.cat(packed_list, dim=1)  # (B, C*W_j, Nj, Nj)
+    return torch.cat(packed_list, dim=1)
 
 
 def unpack_highfreq(packed: torch.Tensor, j: int, meta: Dict) -> List[torch.Tensor]:
@@ -169,17 +189,14 @@ def unpack_highfreq(packed: torch.Tensor, j: int, meta: Dict) -> List[torch.Tens
     angles = meta.get("angles_per_scale", None) or []
     C = meta.get("color_channels", None)
     if C is None:
-        # try to infer from angles if provided
         if angles and 0 < j <= len(angles):
             Wj = int(angles[-j])
             C = max(1, packed_C // max(1, Wj))
         else:
-            # fallback to RGB
             C = 3
     if angles and 0 < j <= len(angles):
         Wj = int(angles[-j])
     else:
-        # infer Wj from channels if color_channels known
         Wj = max(1, packed_C // C)
 
     wedges = []
