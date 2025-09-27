@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--cond_model_path", type=str, default=None)
     args = parser.parse_args()
 
-    assert args.task == "curvelet", "Use --task curvelet for this sampler."
+    assert args.task == "curvelet"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     angles = _angles_list(args.angles_per_scale)
@@ -73,7 +73,6 @@ def main():
 
     steps_for_sampling = _steps_or_default(getattr(args, "diffusion_steps", -1), default_val=256)
 
-    # coarse model
     params_coarse = script_util.model_and_diffusion_defaults(task="curvelet")
     params_coarse.update(dict(
         j=args.j, conditional=False, angles_per_scale=angles,
@@ -87,7 +86,6 @@ def main():
     coarse_model.load_state_dict(torch.load(coarse_model_path, map_location="cpu"))
     coarse_model.to(device).eval()
 
-    # conditional model
     params_cond = script_util.model_and_diffusion_defaults(task="curvelet")
     params_cond.update(dict(
         j=args.j, conditional=True, angles_per_scale=angles,
@@ -101,7 +99,6 @@ def main():
     cond_model.load_state_dict(torch.load(cond_model_path, map_location="cpu"))
     cond_model.to(device).eval()
 
-    # stats for wedges (coarse left unwhitened here for consistency with training)
     stats_npz = os.path.join("results", f"curvelet_J{args.j}", f"curvelet_stats_j{args.j}.npz")
     if os.path.isfile(stats_npz):
         npz = np.load(stats_npz)
@@ -123,13 +120,11 @@ def main():
     while done < num:
         bs = min(args.batch_size, num - done)
 
-        # 1) coarse (unconditional)
         coarse_shape = (bs, C, coarse_hw, coarse_hw)
         with torch.no_grad():
             coarse = coarse_diff.p_sample_loop(coarse_model, coarse_shape, device=device)
             coarse = coarse.clamp(-1, 1)
 
-        # 2) wedges conditional on coarse
         wedge_shape = (bs, C * W_j, coarse_hw, coarse_hw)
         with torch.no_grad():
             wedges_white = cond_diff.p_sample_loop(
@@ -137,14 +132,12 @@ def main():
             )
         wedges = wedges_white * std_w + mean_w
 
-        # 3) inverse curvelet
         wedges_list = curvelet_ops.unpack_highfreq(
             wedges, j=args.j, meta={"angles_per_scale": angles or [], "color_channels": C}
         )
         coeffs = {"coarse": coarse, "bands": [wedges_list]}
         final = curvelet_ops.ifdct2(coeffs, output_size=full_size).clamp(-1, 1)
 
-        # 4) save
         arr = final.detach().cpu().numpy()
         for i in range(arr.shape[0]):
             if C == 1:
